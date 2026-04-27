@@ -12,10 +12,12 @@ import { useRouter } from 'expo-router';
 
 import { AppLogo } from '@/components/auth/app-logo';
 import { AuthForm } from '@/components/auth/auth-form';
+import { getApiBaseUrl } from '@/constants/api';
 import { NeonText } from '@/components/neon-text';
 
 export default function AuthPage() {
   const router = useRouter();
+  const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
 
   const subtitle = useMemo(
     () => 'Authenticate to access social analysis and live wingman support.',
@@ -40,22 +42,30 @@ export default function AuthPage() {
             <NeonText style={styles.subtitle}>{subtitle}</NeonText>
 
             <AuthForm
-              onSubmit={({ mode, username, email, password }) => {
-                if (!email || !password || (mode === 'register' && !username)) {
-                  Alert.alert(
-                    'Missing credentials',
-                    mode === 'register'
-                      ? 'Please provide username, email, and password.'
-                      : 'Please provide both email and password.'
-                  );
-                  return;
+              onSubmit={async ({ mode, email, password, username }) => {
+                const endpoint = mode === 'register' ? '/api/auth/register' : '/api/auth/login';
+                const payload =
+                  mode === 'register'
+                    ? { username, email, password }
+                    : { email, password };
+
+                const response = await fetch(`${apiBaseUrl}${endpoint}`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify(payload),
+                });
+
+                const data = await response.json().catch(() => ({}));
+
+                if (!response.ok) {
+                  throw new Error(data.message || 'Authentication failed.');
                 }
 
                 Alert.alert(
-                  'Demo authentication',
-                  mode === 'register'
-                    ? `Registered ${username} (${email})`
-                    : `Logged in as ${email}`
+                  mode === 'register' ? 'Account created' : 'Login successful',
+                  data.message || 'You can now enter the app.'
                 );
                 router.replace('/(tabs)');
               }}

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { CyberButton } from '@/components/cyber-button';
 import { NeonText } from '@/components/neon-text';
@@ -7,7 +7,7 @@ import { NeonText } from '@/components/neon-text';
 type AuthMode = 'login' | 'register';
 
 type AuthFormProps = {
-  onSubmit?: (payload: { mode: AuthMode; username: string; email: string; password: string }) => void;
+  onSubmit?: (payload: { mode: AuthMode; username: string; email: string; password: string }) => Promise<void> | void;
 };
 
 export function AuthForm({ onSubmit }: AuthFormProps) {
@@ -15,6 +15,7 @@ export function AuthForm({ onSubmit }: AuthFormProps) {
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const modeLabel = useMemo(
     () =>
@@ -23,6 +24,30 @@ export function AuthForm({ onSubmit }: AuthFormProps) {
   );
 
   const buttonLabel = mode === 'login' ? 'Initialize System' : 'Create Operative';
+
+  const handleSubmit = async () => {
+    if (!email.trim() || !password) {
+      Alert.alert(
+        'Missing credentials',
+        mode === 'register'
+          ? 'Please provide username, email, and password.'
+          : 'Please provide both email and password.'
+      );
+      return;
+    }
+
+    if (mode === 'register' && !username.trim()) {
+      Alert.alert('Missing credentials', 'Please provide username, email, and password.');
+      return;
+    }
+
+    try {
+      setIsSubmitting(true);
+      await onSubmit?.({ mode, username: username.trim(), email: email.trim(), password });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
   return (
     <View style={styles.panel}>
@@ -70,10 +95,8 @@ export function AuthForm({ onSubmit }: AuthFormProps) {
       </View>
 
       <CyberButton
-        label={buttonLabel}
-        onPress={() =>
-          onSubmit?.({ mode, username: username.trim(), email: email.trim(), password })
-        }
+        label={isSubmitting ? 'Connecting...' : buttonLabel}
+        onPress={handleSubmit}
       />
 
       <Pressable onPress={() => setMode(mode === 'login' ? 'register' : 'login')}>
