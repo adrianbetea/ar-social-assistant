@@ -44,6 +44,8 @@ export function AuthForm({ onSubmit }: AuthFormProps) {
     try {
       setIsSubmitting(true);
       await onSubmit?.({ mode, username: username.trim(), email: email.trim(), password });
+    } catch (err: any) {
+      Alert.alert('Authentication failed', err?.message || String(err));
     } finally {
       setIsSubmitting(false);
     }

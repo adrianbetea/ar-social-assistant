@@ -2,7 +2,7 @@ import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
 function stripTrailingSlash(value: string) {
-  return value.replace(/\/$/, '');
+  return value.replace(/^['"]|['"]$/g, '').replace(/\/$/, '');
 }
 
 export function getApiBaseUrl() {
@@ -12,8 +12,19 @@ export function getApiBaseUrl() {
     return stripTrailingSlash(envUrl);
   }
 
+  // For web, use localhost:8081 (backend runs on 8081)
+  if (Platform.OS === 'web') {
+    try {
+      const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+      return `http://${host}:3000`;
+    } catch {
+      return 'http://localhost:3000';
+    }
+  }
+
+  // For Android emulators/devices use the development machine IP or expo hostUri
   if (Platform.OS === 'android') {
-    return 'http://192.168.1.7:3000';
+    return 'http://192.168.1.5:3000';
   }
 
   const hostUri = Constants.expoConfig?.hostUri;
@@ -23,5 +34,5 @@ export function getApiBaseUrl() {
     return `http://${host}:3000`;
   }
 
-  return 'http://192.168.1.7:3000';
+  return 'http://localhost:3000';
 }
