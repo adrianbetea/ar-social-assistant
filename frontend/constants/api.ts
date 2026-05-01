@@ -1,6 +1,16 @@
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
+let authToken: string | null = null;
+
+export function setAuthToken(token?: string | null) {
+  authToken = token?.trim() || null;
+}
+
+export function getAuthToken() {
+  return authToken;
+}
+
 function stripTrailingSlash(value: string) {
   return value.replace(/^['"]|['"]$/g, '').replace(/\/$/, '');
 }
@@ -34,5 +44,5 @@ export function getApiBaseUrl() {
     return `http://${host}:3000`;
   }
 
-  return 'http://localhost:3000';
+  return 'http://192.168.1.5:3000';
 }

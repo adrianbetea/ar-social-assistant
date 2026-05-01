@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
     Alert,
     Pressable,
@@ -12,21 +12,100 @@ import { useRouter } from 'expo-router';
 
 import { CyberButton } from '@/components/cyber-button';
 import { NeonText } from '@/components/neon-text';
+import { getApiBaseUrl, getAuthToken } from '@/constants/api';
 
 const languages = ['English', 'Spanish', 'German', 'French', 'Romanian'];
+const defaultConfig = {
+    systemPrompt: 'You are a helpful AR social assistant.',
+    targetLanguage: 'English',
+};
 
 export default function ProfileSettingsScreen() {
     const router = useRouter();
+    const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
     const [systemPrompt, setSystemPrompt] = useState('');
     const [targetLanguage, setTargetLanguage] = useState(languages[0]);
+    const [status, setStatus] = useState<'idle' | 'loading' | 'saving'>('loading');
 
     const helperText = useMemo(
         () => 'Define your assistant tone, behavior, and constraints for live support.',
         []
     );
 
-    const handleSave = () => {
-        Alert.alert('Configuration saved', 'Your AI core settings are ready.');
+    useEffect(() => {
+        let isMounted = true;
+
+        const loadConfig = async () => {
+            setStatus('loading');
+            try {
+                const token = getAuthToken();
+                const response = await fetch(`${apiBaseUrl}/api/user/config`, {
+                    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+                });
+                const data = await response.json().catch(() => ({}));
+
+                if (!response.ok) {
+                    throw new Error(data.message || 'Failed to load configuration.');
+                }
+
+                if (isMounted) {
+                    setSystemPrompt(data.systemPrompt || defaultConfig.systemPrompt);
+                    setTargetLanguage(data.targetLanguage || defaultConfig.targetLanguage);
+                    setStatus('idle');
+                }
+            } catch (error) {
+                if (isMounted) {
+                    setSystemPrompt(defaultConfig.systemPrompt);
+                    setTargetLanguage(defaultConfig.targetLanguage);
+                    setStatus('idle');
+                }
+            }
+        };
+
+        loadConfig();
+
+        return () => {
+            isMounted = false;
+        };
+    }, [apiBaseUrl]);
+
+    const handleSave = async () => {
+        const token = getAuthToken();
+
+        if (!token) {
+            Alert.alert('Sign in required', 'Please log in to save your configuration.');
+            return;
+        }
+
+        setStatus('saving');
+
+        try {
+            const response = await fetch(`${apiBaseUrl}/api/user/config`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                    systemPrompt,
+                    targetLanguage,
+                }),
+            });
+
+            const data = await response.json().catch(() => ({}));
+
+            if (!response.ok) {
+                throw new Error(data.message || 'Failed to update configuration.');
+            }
+
+            setSystemPrompt(data.systemPrompt || systemPrompt);
+            setTargetLanguage(data.targetLanguage || targetLanguage);
+            Alert.alert('Configuration saved', 'Your AI core settings are ready.');
+        } catch (error) {
+            Alert.alert('Save failed', 'Unable to update settings right now.');
+        } finally {
+            setStatus('idle');
+        }
     };
 
     return (
@@ -51,6 +130,7 @@ export default function ProfileSettingsScreen() {
                         placeholderTextColor="#6d98a6"
                         value={systemPrompt}
                         onChangeText={setSystemPrompt}
+                        editable={status !== 'saving'}
                         style={styles.promptInput}
                     />
                 </View>
@@ -71,7 +151,8 @@ export default function ProfileSettingsScreen() {
                                         isActive && styles.languageChipActive,
                                         pressed && styles.languageChipPressed,
                                     ]}
-                                    onPress={() => setTargetLanguage(language)}>
+                                    onPress={() => setTargetLanguage(language)}
+                                    disabled={status === 'saving'}>
                                     <NeonText style={[styles.languageLabel, isActive && styles.languageLabelActive]}>
                                         {language}
                                     </NeonText>
@@ -86,6 +167,9 @@ export default function ProfileSettingsScreen() {
                     <NeonText style={styles.sectionCopy}>
                         Save your configuration to sync with the assistant runtime.
                     </NeonText>
+                    {status === 'saving' ? (
+                        <NeonText style={styles.statusText}>Saving configuration...</NeonText>
+                    ) : null}
                     <CyberButton label="Save Configuration" onPress={handleSave} />
                 </View>
             </ScrollView>
@@ -165,6 +249,11 @@ const styles = StyleSheet.create({
         color: '#9ad4df',
         textShadowColor: 'rgba(55, 230, 255, 0.2)',
         textShadowRadius: 6,
+    },
+    statusText: {
+        fontSize: 12,
+        color: '#8dc7d4',
+        textShadowColor: 'transparent',
     },
     promptInput: {
         minHeight: 140,

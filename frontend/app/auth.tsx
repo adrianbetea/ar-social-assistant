@@ -12,7 +12,7 @@ import { useRouter } from 'expo-router';
 
 import { AppLogo } from '@/components/auth/app-logo';
 import { AuthForm } from '@/components/auth/auth-form';
-import { getApiBaseUrl } from '@/constants/api';
+import { getApiBaseUrl, setAuthToken } from '@/constants/api';
 import { NeonText } from '@/components/neon-text';
 
 export default function AuthPage() {
@@ -67,6 +67,9 @@ export default function AuthPage() {
                   mode === 'register' ? 'Account created' : 'Login successful',
                   data.message || 'You can now enter the app.'
                 );
+                if (data.token) {
+                  setAuthToken(data.token);
+                }
                 router.replace('/(tabs)');
               }}
             />

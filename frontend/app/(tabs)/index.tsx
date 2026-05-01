@@ -1,8 +1,10 @@
+import { useCallback, useMemo, useState } from 'react';
 import { Pressable, SafeAreaView, ScrollView, StyleSheet, View } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 
 import { CyberButton } from '@/components/cyber-button';
 import { NeonText } from '@/components/neon-text';
+import { getApiBaseUrl, getAuthToken } from '@/constants/api';
 
 const coreModules = [
   { label: 'Vision + AR Overlay', status: 'Online', detail: 'Camera feed primed' },
@@ -15,8 +17,63 @@ const quickActions = [
   { label: 'Recent Logs', meta: 'Last session 2h ago', route: '/(tabs)/explore' },
 ];
 
+const defaultConfig = {
+  systemPrompt: 'You are a helpful AR social assistant.',
+  targetLanguage: 'English',
+};
+
 export default function HomeScreen() {
   const router = useRouter();
+  const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
+  const [config, setConfig] = useState(defaultConfig);
+  const [configStatus, setConfigStatus] = useState<'idle' | 'loading' | 'error'>('loading');
+
+  const promptPreview = useMemo(() => {
+    const trimmed = config.systemPrompt.trim();
+    return trimmed.length > 60 ? `${trimmed.slice(0, 57)}...` : trimmed;
+  }, [config.systemPrompt]);
+
+  const loadConfig = useCallback(() => {
+    let isActive = true;
+
+    const fetchConfig = async () => {
+      setConfigStatus('loading');
+
+      try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBaseUrl}/api/user/config`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          throw new Error(data.message || 'Failed to load configuration.');
+        }
+
+        if (isActive) {
+          setConfig({
+            systemPrompt: data.systemPrompt || defaultConfig.systemPrompt,
+            targetLanguage: data.targetLanguage || defaultConfig.targetLanguage,
+          });
+          setConfigStatus('idle');
+        }
+      } catch (error) {
+        if (isActive) {
+          setConfig(defaultConfig);
+          setConfigStatus('error');
+        }
+      }
+    };
+
+    fetchConfig();
+
+    return () => {
+      isActive = false;
+    };
+  }, [apiBaseUrl]);
+
+  useFocusEffect(loadConfig);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -71,14 +128,20 @@ export default function HomeScreen() {
           <NeonText style={styles.configCopy}>
             Tune the AI core instructions, target language, and assistant behavior.
           </NeonText>
+          {configStatus === 'loading' ? (
+            <NeonText style={styles.configStatus}>Syncing latest settings...</NeonText>
+          ) : null}
+          {configStatus === 'error' ? (
+            <NeonText style={styles.configStatus}>Using default settings.</NeonText>
+          ) : null}
           <View style={styles.configRow}>
             <View style={styles.configBlock}>
-              <NeonText style={styles.configValue}>Profile</NeonText>
-              <NeonText style={styles.configLabel}>Persona + tone</NeonText>
+              <NeonText style={styles.configValue}>Persona</NeonText>
+              <NeonText style={styles.configLabel}>{promptPreview || 'Default core prompt'}</NeonText>
             </View>
             <View style={styles.configBlock}>
-              <NeonText style={styles.configValue}>Language</NeonText>
-              <NeonText style={styles.configLabel}>Auto-translate</NeonText>
+              <NeonText style={styles.configValue}>{config.targetLanguage}</NeonText>
+              <NeonText style={styles.configLabel}>Target language</NeonText>
             </View>
           </View>
           <CyberButton label="Open Profile Settings" onPress={() => router.push('/profile')} />
@@ -249,6 +312,11 @@ const styles = StyleSheet.create({
     color: '#9ad4df',
     textShadowColor: 'rgba(55, 230, 255, 0.2)',
     textShadowRadius: 6,
+  },
+  configStatus: {
+    fontSize: 12,
+    color: '#8dc7d4',
+    textShadowColor: 'transparent',
   },
   configRow: {
     flexDirection: 'row',
