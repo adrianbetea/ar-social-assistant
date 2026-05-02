@@ -109,7 +109,7 @@ export default function HomeScreen() {
           <NeonText style={styles.actionCopy}>
             Activate AR overlay, live transcription, and real-time social insight.
           </NeonText>
-          <CyberButton label="Start Assistant" onPress={() => router.push('/(tabs)/explore')} />
+          <CyberButton label="Start Assistant" onPress={() => router.push('/assistant-hud')} />
           <View style={styles.quickGrid}>
             {quickActions.map((action) => (
               <Pressable
