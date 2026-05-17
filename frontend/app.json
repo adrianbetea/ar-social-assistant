@@ -12,11 +12,14 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSCameraUsageDescription": "Allow access to the camera for the AR assistant.",
-        "NSMicrophoneUsageDescription": "Allow access to the microphone for live conversation analysis."
+        "NSMicrophoneUsageDescription": "Allow access to the microphone for live conversation analysis.",
+        "NSSpeechRecognitionUsageDescription": "Allow on-device speech recognition for live translation."
       }
     },
     "android": {
       "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
         "CAMERA",
         "RECORD_AUDIO"
       ],
@@ -27,7 +30,8 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.adrian123114818.frontend"
     },
     "web": {
       "output": "static",

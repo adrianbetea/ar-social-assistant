@@ -1,17 +1,12 @@
-import { useEffect, useMemo } from 'react';
-import { Pressable, SafeAreaView, StyleSheet, View, useWindowDimensions } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Platform, Pressable, SafeAreaView, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { useRouter } from 'expo-router';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 
 import { NeonText } from '@/components/neon-text';
+import { getApiBaseUrl, getAuthToken } from '@/constants/api';
 
-const statusPills = [
-    { label: 'MIC', value: 'LIVE' },
-    { label: 'AI', value: 'SYNC' },
-    { label: 'NET', value: 'STEADY' },
-];
-
-const suggestions = [
+const idleSuggestions = [
     'Ask about their latest project.',
     'Mirror their energy and smile.',
     'Offer a quick compliment on their style.',
@@ -21,10 +16,28 @@ export default function AssistantHudScreen() {
     const router = useRouter();
     const { width, height } = useWindowDimensions();
     const timestamp = useMemo(() => new Date().toLocaleTimeString(), []);
+    const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
+    const cameraRef = useRef<CameraView | null>(null);
     const [cameraPermission, requestCameraPermission] = useCameraPermissions();
     const [micPermission, requestMicPermission] = useMicrophonePermissions();
+    const [isCameraReady, setIsCameraReady] = useState(false);
+    const [analysis, setAnalysis] = useState('');
+    const [translation, setTranslation] = useState('');
+    const [suggestions, setSuggestions] = useState<string[]>(idleSuggestions);
+    const [aiStatus, setAiStatus] = useState<'IDLE' | 'SYNC' | 'LIVE' | 'ERROR'>('IDLE');
+    const [netStatus, setNetStatus] = useState<'STEADY' | 'AUTH' | 'ERROR'>('STEADY');
+    const [isRequestInFlight, setIsRequestInFlight] = useState(false);
+    const [speechStatus, setSpeechStatus] = useState<'IDLE' | 'LIVE' | 'ERROR'>('IDLE');
 
     const hasPermissions = Boolean(cameraPermission?.granted && micPermission?.granted);
+    const statusPills = useMemo(
+        () => [
+            { label: 'MIC', value: hasPermissions ? speechStatus : 'OFF' },
+            { label: 'AI', value: aiStatus },
+            { label: 'NET', value: netStatus },
+        ],
+        [aiStatus, hasPermissions, netStatus, speechStatus]
+    );
     const hudOverlayStyle = useMemo(() => {
         const overlayWidth = height;
         const overlayHeight = width;
@@ -53,11 +66,224 @@ export default function AssistantHudScreen() {
         }
     }, [cameraPermission, micPermission, requestCameraPermission, requestMicPermission]);
 
+    useEffect(() => {
+        if (!hasPermissions) {
+            return undefined;
+        }
+
+        let isActive = true;
+
+        if (Platform.OS === 'web') {
+            const SpeechRecognition =
+                (window as unknown as { SpeechRecognition?: typeof window.SpeechRecognition }).SpeechRecognition ||
+                (window as unknown as { webkitSpeechRecognition?: typeof window.SpeechRecognition }).webkitSpeechRecognition;
+
+            if (!SpeechRecognition) {
+                setSpeechStatus('ERROR');
+                setTranslation('Speech recognition unavailable in this browser.');
+                return undefined;
+            }
+
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event: SpeechRecognitionEvent) => {
+                const result = event.results[event.results.length - 1];
+                const transcript = result?.[0]?.transcript?.trim();
+                if (transcript && isActive) {
+                    setTranslation(transcript);
+                }
+            };
+
+            recognition.onerror = () => {
+                if (isActive) {
+                    setSpeechStatus('ERROR');
+                    setTranslation('Speech recognition stopped.');
+                }
+            };
+
+            recognition.onend = () => {
+                if (isActive) {
+                    try {
+                        recognition.start();
+                    } catch (error) {
+                        setSpeechStatus('ERROR');
+                    }
+                }
+            };
+
+            try {
+                recognition.start();
+                setSpeechStatus('LIVE');
+            } catch (error) {
+                setSpeechStatus('ERROR');
+                setTranslation('Speech recognition failed to start.');
+            }
+
+            return () => {
+                isActive = false;
+                recognition.stop();
+            };
+        }
+
+        const { NativeModules } = require('react-native');
+        if (!NativeModules?.Voice) {
+            setSpeechStatus('ERROR');
+            setTranslation('Speech recognition requires a dev build.');
+            return () => {
+                isActive = false;
+            };
+        }
+
+        const voiceModule = require('react-native-voice');
+        const Voice = voiceModule.default || voiceModule;
+
+        Voice.onSpeechResults = (event) => {
+            const transcript = event.value?.[0]?.trim();
+            if (transcript && isActive) {
+                setTranslation(transcript);
+            }
+        };
+
+        Voice.onSpeechPartialResults = (event) => {
+            const transcript = event.value?.[0]?.trim();
+            if (transcript && isActive) {
+                setTranslation(transcript);
+            }
+        };
+
+        Voice.onSpeechError = () => {
+            if (isActive) {
+                setSpeechStatus('ERROR');
+                setTranslation('Speech recognition error.');
+            }
+        };
+
+        Voice.start('en-US')
+            .then(() => {
+                if (isActive) {
+                    setSpeechStatus('LIVE');
+                }
+            })
+            .catch(() => {
+                if (isActive) {
+                    setSpeechStatus('ERROR');
+                    setTranslation('Speech recognition failed to start.');
+                }
+            });
+
+        return () => {
+            isActive = false;
+            Voice.destroy().then(Voice.removeAllListeners);
+        };
+    }, [hasPermissions]);
+
+    const captureAndAnalyze = useCallback(async () => {
+        const token = getAuthToken();
+
+        if (!token) {
+            setNetStatus('AUTH');
+            return;
+        }
+
+        if (!cameraRef.current || isRequestInFlight) {
+            return;
+        }
+
+        setIsRequestInFlight(true);
+
+        setAiStatus('SYNC');
+        setNetStatus('STEADY');
+
+        try {
+            const snapshot = await cameraRef.current.takePictureAsync({
+                base64: true,
+                quality: 0.4,
+                skipProcessing: true,
+            });
+
+            if (!snapshot.base64) {
+                throw new Error('Missing camera frame.');
+            }
+
+            const response = await fetch(`${apiBaseUrl}/api/ai/analyze-environment`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                    imageBase64: snapshot.base64,
+                    imageMimeType: snapshot.mimeType || 'image/jpeg',
+                    prompt: 'Provide a quick social read and wingman tips. Return translation as an empty string.',
+                    translationSnippet: translation,
+                }),
+            });
+
+            const data = await response.json().catch(() => ({}));
+
+            if (!response.ok) {
+                throw new Error(data.message || 'Failed to reach assistant.');
+            }
+
+            setAnalysis(data.analysis || 'Scanning social cues...');
+            setTranslation(data.translation || '');
+            if (Array.isArray(data.wingmanSuggestions) && data.wingmanSuggestions.length > 0) {
+                setSuggestions(data.wingmanSuggestions);
+            }
+            setAiStatus('LIVE');
+        } catch (error) {
+            setAiStatus('ERROR');
+            setNetStatus('ERROR');
+        } finally {
+            setIsRequestInFlight(false);
+        }
+    }, [apiBaseUrl, isRequestInFlight]);
+
+    useEffect(() => {
+        if (!hasPermissions || !isCameraReady) {
+            return undefined;
+        }
+
+        let isActive = true;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+
+        const loop = async () => {
+            if (!isActive) {
+                return;
+            }
+
+            await captureAndAnalyze();
+
+            if (!isActive) {
+                return;
+            }
+
+            timer = setTimeout(loop, 8000);
+        };
+
+        timer = setTimeout(loop, 2500);
+
+        return () => {
+            isActive = false;
+            if (timer) {
+                clearTimeout(timer);
+            }
+        };
+    }, [captureAndAnalyze, hasPermissions, isCameraReady]);
+
     return (
         <SafeAreaView style={styles.safeArea}>
             <View style={styles.cameraSurface}>
                 {hasPermissions ? (
-                    <CameraView style={styles.camera} facing="back" />
+                    <CameraView
+                        ref={cameraRef}
+                        style={styles.camera}
+                        facing="back"
+                        onCameraReady={() => setIsCameraReady(true)}
+                    />
                 ) : (
                     <View style={styles.permissionCard}>
                         <NeonText style={styles.permissionTitle}>Camera + Microphone Access</NeonText>
@@ -105,9 +331,9 @@ export default function AssistantHudScreen() {
 
                     <View style={styles.panelLeft}>
                         <NeonText style={styles.panelTitle}>Subject Analysis</NeonText>
-                        <NeonText style={styles.panelLine}>Emotion: Focused</NeonText>
-                        <NeonText style={styles.panelLine}>Engagement: High</NeonText>
-                        <NeonText style={styles.panelLine}>Vibe: Open</NeonText>
+                        <NeonText style={styles.panelLine}>
+                            {analysis || 'Scanning social cues...'}
+                        </NeonText>
                     </View>
 
                     <View style={styles.panelRight}>
@@ -122,7 +348,7 @@ export default function AssistantHudScreen() {
                     <View style={styles.subtitlePanel}>
                         <NeonText style={styles.subtitleLabel}>Live Translation</NeonText>
                         <NeonText style={styles.subtitleText}>
-            "Como estuvo tu dia?" -> "How was your day?"
+                            {translation || 'Listening for speech...'}
                         </NeonText>
                     </View>
 
@@ -295,7 +521,7 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         borderWidth: 1,
         borderColor: 'rgba(76, 231, 255, 0.35)',
-        backgroundColor: 'rgba(4, 22, 34, 0.78)',
+        backgroundColor: 'rgba(4, 22, 34, 0.55)',
         padding: 12,
         gap: 6,
     },
@@ -307,7 +533,7 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         borderWidth: 1,
         borderColor: 'rgba(255, 97, 97, 0.35)',
-        backgroundColor: 'rgba(28, 8, 16, 0.78)',
+        backgroundColor: 'rgba(28, 8, 16, 0.55)',
         padding: 12,
         gap: 6,
     },
@@ -330,7 +556,7 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         borderWidth: 1,
         borderColor: 'rgba(76, 231, 255, 0.35)',
-        backgroundColor: 'rgba(6, 25, 38, 0.85)',
+        backgroundColor: 'rgba(6, 25, 38, 0.6)',
         paddingVertical: 10,
         paddingHorizontal: 14,
         gap: 6,
