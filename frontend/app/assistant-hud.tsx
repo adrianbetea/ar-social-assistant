@@ -12,6 +12,43 @@ const idleSuggestions = [
     'Offer a quick compliment on their style.',
 ];
 
+const ANALYSIS_INTERVAL_MS = 5000;
+const UI_REFRESH_INTERVAL_MS = 10000;
+const ANALYSIS_LOCK_MS = 15000;
+const CONTEXT_LIMIT = 5;
+const SIMILARITY_THRESHOLD = 0.7;
+const SUGGESTIONS_SIMILARITY_THRESHOLD = 0.55;
+
+function normalizeText(value: string) {
+    return value.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function similarityScore(a: string, b: string) {
+    const left = normalizeText(a);
+    const right = normalizeText(b);
+
+    if (!left || !right) {
+        return 0;
+    }
+
+    if (left === right) {
+        return 1;
+    }
+
+    const leftTokens = new Set(left.split(' '));
+    const rightTokens = new Set(right.split(' '));
+    let intersection = 0;
+
+    leftTokens.forEach((token) => {
+        if (rightTokens.has(token)) {
+            intersection += 1;
+        }
+    });
+
+    const union = leftTokens.size + rightTokens.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+
 export default function AssistantHudScreen() {
     const router = useRouter();
     const { width, height } = useWindowDimensions();
@@ -23,11 +60,19 @@ export default function AssistantHudScreen() {
     const [isCameraReady, setIsCameraReady] = useState(false);
     const [analysis, setAnalysis] = useState('');
     const [translation, setTranslation] = useState('');
+    const [speechText, setSpeechText] = useState('');
     const [suggestions, setSuggestions] = useState<string[]>(idleSuggestions);
+    const [latestTip, setLatestTip] = useState('');
     const [aiStatus, setAiStatus] = useState<'IDLE' | 'SYNC' | 'LIVE' | 'ERROR'>('IDLE');
     const [netStatus, setNetStatus] = useState<'STEADY' | 'AUTH' | 'ERROR'>('STEADY');
     const [isRequestInFlight, setIsRequestInFlight] = useState(false);
     const [speechStatus, setSpeechStatus] = useState<'IDLE' | 'LIVE' | 'ERROR'>('IDLE');
+    const lastUiRefreshAtRef = useRef(0);
+    const lastAnalysisRefreshAtRef = useRef(0);
+    const contextHistoryRef = useRef<string[]>([]);
+    const lastTipRef = useRef('');
+    const lastAnalysisRef = useRef('');
+    const lastSuggestionsRef = useRef<string[]>([]);
 
     const hasPermissions = Boolean(cameraPermission?.granted && micPermission?.granted);
     const statusPills = useMemo(
@@ -80,7 +125,7 @@ export default function AssistantHudScreen() {
 
             if (!SpeechRecognition) {
                 setSpeechStatus('ERROR');
-                setTranslation('Speech recognition unavailable in this browser.');
+                setSpeechText('Speech recognition unavailable in this browser.');
                 return undefined;
             }
 
@@ -93,14 +138,14 @@ export default function AssistantHudScreen() {
                 const result = event.results[event.results.length - 1];
                 const transcript = result?.[0]?.transcript?.trim();
                 if (transcript && isActive) {
-                    setTranslation(transcript);
+                    setSpeechText(transcript);
                 }
             };
 
             recognition.onerror = () => {
                 if (isActive) {
                     setSpeechStatus('ERROR');
-                    setTranslation('Speech recognition stopped.');
+                    setSpeechText('Speech recognition stopped.');
                 }
             };
 
@@ -119,7 +164,7 @@ export default function AssistantHudScreen() {
                 setSpeechStatus('LIVE');
             } catch (error) {
                 setSpeechStatus('ERROR');
-                setTranslation('Speech recognition failed to start.');
+                setSpeechText('Speech recognition failed to start.');
             }
 
             return () => {
@@ -131,7 +176,7 @@ export default function AssistantHudScreen() {
         const { NativeModules } = require('react-native');
         if (!NativeModules?.Voice) {
             setSpeechStatus('ERROR');
-            setTranslation('Speech recognition requires a dev build.');
+            setSpeechText('Speech recognition requires a dev build.');
             return () => {
                 isActive = false;
             };
@@ -143,21 +188,21 @@ export default function AssistantHudScreen() {
         Voice.onSpeechResults = (event) => {
             const transcript = event.value?.[0]?.trim();
             if (transcript && isActive) {
-                setTranslation(transcript);
+                setSpeechText(transcript);
             }
         };
 
         Voice.onSpeechPartialResults = (event) => {
             const transcript = event.value?.[0]?.trim();
             if (transcript && isActive) {
-                setTranslation(transcript);
+                setSpeechText(transcript);
             }
         };
 
         Voice.onSpeechError = () => {
             if (isActive) {
                 setSpeechStatus('ERROR');
-                setTranslation('Speech recognition error.');
+                setSpeechText('Speech recognition error.');
             }
         };
 
@@ -170,7 +215,7 @@ export default function AssistantHudScreen() {
             .catch(() => {
                 if (isActive) {
                     setSpeechStatus('ERROR');
-                    setTranslation('Speech recognition failed to start.');
+                    setSpeechText('Speech recognition failed to start.');
                 }
             });
 
@@ -202,6 +247,7 @@ export default function AssistantHudScreen() {
                 base64: true,
                 quality: 0.4,
                 skipProcessing: true,
+                shutterSound: false,
             });
 
             if (!snapshot.base64) {
@@ -218,7 +264,8 @@ export default function AssistantHudScreen() {
                     imageBase64: snapshot.base64,
                     imageMimeType: snapshot.mimeType || 'image/jpeg',
                     prompt: 'Provide a quick social read and wingman tips. Return translation as an empty string.',
-                    translationSnippet: translation,
+                    translationSnippet: speechText,
+                    contextHistory: contextHistoryRef.current,
                 }),
             });
 
@@ -228,10 +275,55 @@ export default function AssistantHudScreen() {
                 throw new Error(data.message || 'Failed to reach assistant.');
             }
 
-            setAnalysis(data.analysis || 'Scanning social cues...');
-            setTranslation(data.translation || '');
-            if (Array.isArray(data.wingmanSuggestions) && data.wingmanSuggestions.length > 0) {
-                setSuggestions(data.wingmanSuggestions);
+            const now = Date.now();
+            const nextAnalysis = data.analysis || 'Scanning social cues...';
+            const nextSuggestions = Array.isArray(data.wingmanSuggestions) ? data.wingmanSuggestions : [];
+            const nextTip = nextSuggestions[0] || '';
+
+            const tipSimilarity = similarityScore(nextTip, lastTipRef.current);
+            if (nextTip && tipSimilarity < SIMILARITY_THRESHOLD) {
+                setLatestTip(nextTip);
+                lastTipRef.current = nextTip;
+            }
+
+            const analysisSimilarity = similarityScore(nextAnalysis, lastAnalysisRef.current);
+            if (now - lastAnalysisRefreshAtRef.current >= ANALYSIS_LOCK_MS && analysisSimilarity < SIMILARITY_THRESHOLD) {
+                setAnalysis(nextAnalysis);
+                lastAnalysisRefreshAtRef.current = now;
+                lastAnalysisRef.current = nextAnalysis;
+            }
+
+            if (now - lastUiRefreshAtRef.current >= UI_REFRESH_INTERVAL_MS && nextSuggestions.length > 0) {
+                const previousList = lastSuggestionsRef.current.join(' | ');
+                const nextList = nextSuggestions.join(' | ');
+                const listSimilarity = similarityScore(nextList, previousList);
+
+                if (listSimilarity < SUGGESTIONS_SIMILARITY_THRESHOLD) {
+                    setSuggestions(nextSuggestions);
+                    lastSuggestionsRef.current = nextSuggestions;
+                    lastUiRefreshAtRef.current = now;
+                }
+            }
+
+            if (data.translation) {
+                setTranslation(data.translation);
+            }
+
+            if (nextAnalysis || nextTip || speechText) {
+                const historyEntry = [
+                    nextAnalysis ? `Analysis: ${nextAnalysis}` : '',
+                    nextTip ? `Tip: ${nextTip}` : '',
+                    speechText ? `Heard: ${speechText}` : '',
+                ]
+                    .filter(Boolean)
+                    .join(' | ')
+                    .slice(0, 240);
+                if (historyEntry) {
+                    contextHistoryRef.current = [
+                        historyEntry,
+                        ...contextHistoryRef.current,
+                    ].slice(0, CONTEXT_LIMIT);
+                }
             }
             setAiStatus('LIVE');
         } catch (error) {
@@ -240,7 +332,7 @@ export default function AssistantHudScreen() {
         } finally {
             setIsRequestInFlight(false);
         }
-    }, [apiBaseUrl, isRequestInFlight]);
+    }, [apiBaseUrl, isRequestInFlight, speechText]);
 
     useEffect(() => {
         if (!hasPermissions || !isCameraReady) {
@@ -261,10 +353,10 @@ export default function AssistantHudScreen() {
                 return;
             }
 
-            timer = setTimeout(loop, 8000);
+            timer = setTimeout(loop, ANALYSIS_INTERVAL_MS);
         };
 
-        timer = setTimeout(loop, 2500);
+        timer = setTimeout(loop, 1500);
 
         return () => {
             isActive = false;
@@ -282,6 +374,8 @@ export default function AssistantHudScreen() {
                         ref={cameraRef}
                         style={styles.camera}
                         facing="back"
+                        flash="off"
+                        enableTorch={false}
                         onCameraReady={() => setIsCameraReady(true)}
                     />
                 ) : (
@@ -338,6 +432,11 @@ export default function AssistantHudScreen() {
 
                     <View style={styles.panelRight}>
                         <NeonText style={styles.panelTitle}>Wingman Suggestions</NeonText>
+                        <NeonText style={styles.panelLine}>Latest tip:</NeonText>
+                        <NeonText style={styles.panelLine}>
+                            {latestTip || suggestions[0] || 'Standby for a prompt...'}
+                        </NeonText>
+                        <NeonText style={styles.panelLine}>Stable cues:</NeonText>
                         {suggestions.map((suggestion) => (
                             <NeonText key={suggestion} style={styles.panelLine}>
                                 - {suggestion}
@@ -348,7 +447,7 @@ export default function AssistantHudScreen() {
                     <View style={styles.subtitlePanel}>
                         <NeonText style={styles.subtitleLabel}>Live Translation</NeonText>
                         <NeonText style={styles.subtitleText}>
-                            {translation || 'Listening for speech...'}
+                            {translation || speechText || 'Listening for speech...'}
                         </NeonText>
                     </View>
 

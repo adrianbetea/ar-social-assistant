@@ -17,11 +17,72 @@ const pool = mysql.createPool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const LIBRE_TRANSLATE_URL = process.env.LIBRE_TRANSLATE_URL || 'http://localhost:5000';
 
 const DEFAULT_CONFIG = {
 	systemPrompt: 'You are a helpful AR social assistant.',
 	targetLanguage: 'English',
 };
+
+const LANGUAGE_CODE_MAP = {
+	english: 'en',
+	romanian: 'ro',
+	french: 'fr',
+	spanish: 'es',
+	german: 'de',
+	italian: 'it',
+	portuguese: 'pt',
+	dutch: 'nl',
+	polish: 'pl',
+	russian: 'ru',
+	japanese: 'ja',
+	korean: 'ko',
+	chinese: 'zh',
+};
+
+function resolveTargetLanguageCode(targetLanguage) {
+	if (!targetLanguage) {
+		return 'en';
+	}
+
+	const normalized = String(targetLanguage).trim().toLowerCase();
+	return LANGUAGE_CODE_MAP[normalized] || normalized.slice(0, 2) || 'en';
+}
+
+
+async function translateWithLibre({ text, targetLanguage }) {
+	if (!text || !LIBRE_TRANSLATE_URL) {
+		return '';
+	}
+
+	const target = resolveTargetLanguageCode(targetLanguage);
+
+	try {
+		const response = await fetch(`${LIBRE_TRANSLATE_URL}/translate`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				q: text,
+				source: 'auto',
+				target,
+				format: 'text',
+			}),
+		});
+
+		if (!response.ok) {
+			return '';
+		}
+
+		const data = await response.json().catch(() => ({}));
+		return typeof data?.translatedText === 'string' ? data.translatedText : '';
+	} catch (error) {
+		console.warn('LibreTranslate error:', error);
+		return '';
+	}
+}
+
 
 function getUserIdFromAuthHeader(headerValue) {
 	if (!headerValue) {
@@ -168,6 +229,12 @@ router.post('/analyze-environment', async (req, res) => {
 		}
 
 		const userConfig = await loadUserConfig(userId);
+		const translatedText = translationSnippet
+			? await translateWithLibre({
+				text: translationSnippet,
+				targetLanguage: userConfig.targetLanguage,
+			})
+			: '';
 		const promptText = buildPrompt({
 			systemPrompt: userConfig.systemPrompt,
 			targetLanguage: userConfig.targetLanguage,
@@ -175,35 +242,46 @@ router.post('/analyze-environment', async (req, res) => {
 			contextHistory,
 		});
 
-		const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-		const result = await ai.models.generateContent({
-			model: 'gemini-2.5-flash',
-			contents: [
-				{
-					role: 'user',
-					parts: [
-						{ text: promptText },
-						{
-							inlineData: {
-								mimeType: imageMimeType || 'image/jpeg',
-								data: imageBase64,
+		let parsed = null;
+		let text = '';
+		try {
+			const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+			const result = await ai.models.generateContent({
+				model: 'gemini-2.5-flash',
+				contents: [
+					{
+						role: 'user',
+						parts: [
+							{ text: promptText },
+							{
+								inlineData: {
+									mimeType: imageMimeType || 'image/jpeg',
+									data: imageBase64,
+								},
 							},
-						},
-					],
-				},
-			],
-		});
+						],
+					},
+				],
+			});
 
-		console.log('Gemini raw result keys:', Object.keys(result || {}));
-		console.log('Gemini raw response keys:', Object.keys(result?.response || {}));
-		const text = extractTextFromResult(result);
-		console.log('Gemini response text:', text);
-		if (!text) {
-			console.log('Gemini response raw:', JSON.stringify(result || {}, null, 2));
+			console.log('Gemini raw result keys:', Object.keys(result || {}));
+			console.log('Gemini raw response keys:', Object.keys(result?.response || {}));
+			text = extractTextFromResult(result);
+			console.log('Gemini response text:', text);
+			if (!text) {
+				console.log('Gemini response raw:', JSON.stringify(result || {}, null, 2));
+			}
+			parsed = safeParseJson(text);
+		} catch (error) {
+			console.error('Gemini analyze error:', error);
+			return res.json({
+				analysis: '',
+				translation: translatedText || '',
+				wingmanSuggestions: [],
+			});
 		}
-		const parsed = safeParseJson(text);
 		if (parsed && typeof parsed === 'object') {
-			parsed.translation = normalizeTranslation(parsed.translation);
+			parsed.translation = translatedText || '';
 			if (typeof parsed.analysis === 'string') {
 				parsed.analysis = parsed.analysis.slice(0, 120);
 			}
@@ -218,7 +296,7 @@ router.post('/analyze-environment', async (req, res) => {
 			await logInteraction({
 				userId,
 				analysis: parsed.analysis,
-				translationSnippet: translationSnippet || parsed.translation,
+				translationSnippet: translatedText || translationSnippet || parsed.translation,
 			});
 		}
 
@@ -228,7 +306,7 @@ router.post('/analyze-environment', async (req, res) => {
 
 		return res.json({
 			analysis: '',
-			translation: '',
+			translation: translatedText || '',
 			wingmanSuggestions: [],
 			rawText: text,
 		});
