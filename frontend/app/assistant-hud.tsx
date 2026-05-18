@@ -12,9 +12,9 @@ const idleSuggestions = [
     'Offer a quick compliment on their style.',
 ];
 
-const ANALYSIS_INTERVAL_MS = 5000;
-const UI_REFRESH_INTERVAL_MS = 10000;
-const ANALYSIS_LOCK_MS = 15000;
+const ANALYSIS_INTERVAL_MS = 10000;
+const UI_REFRESH_INTERVAL_MS = 11000;
+const ANALYSIS_LOCK_MS = 10000;
 const CONTEXT_LIMIT = 5;
 const SIMILARITY_THRESHOLD = 0.7;
 const SUGGESTIONS_SIMILARITY_THRESHOLD = 0.55;
@@ -305,11 +305,11 @@ export default function AssistantHudScreen() {
                 }
             }
 
-            if (data.translation) {
+            if (typeof data.translation === 'string') {
                 setTranslation(data.translation);
             }
 
-            if (nextAnalysis || nextTip || speechText) {
+            if (speechText) {
                 const historyEntry = [
                     nextAnalysis ? `Analysis: ${nextAnalysis}` : '',
                     nextTip ? `Tip: ${nextTip}` : '',

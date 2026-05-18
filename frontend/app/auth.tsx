@@ -70,7 +70,7 @@ export default function AuthPage() {
                 if (data.token) {
                   setAuthToken(data.token);
                 }
-                router.replace('/(tabs)');
+                router.replace('/home');
               }}
             />
           </View>

@@ -34,7 +34,7 @@ export function getApiBaseUrl() {
 
   // For Android emulators/devices use the development machine IP or expo hostUri
   if (Platform.OS === 'android') {
-    return 'http://192.168.1.7:3000';
+    return 'http://192.168.1.3:3000';
   }
 
   const hostUri = Constants.expoConfig?.hostUri;
@@ -44,5 +44,5 @@ export function getApiBaseUrl() {
     return `http://${host}:3000`;
   }
 
-  return 'http://192.168.1.7:3000';
+  return 'http://192.168.1.3:3000';
 }

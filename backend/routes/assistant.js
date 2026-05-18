@@ -83,6 +83,50 @@ async function translateWithLibre({ text, targetLanguage }) {
 	}
 }
 
+async function detectLanguageWithLibre(text) {
+	if (!text || !LIBRE_TRANSLATE_URL) {
+		return null;
+	}
+
+	try {
+		const response = await fetch(`${LIBRE_TRANSLATE_URL}/detect`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				q: text,
+			}),
+		});
+
+		if (!response.ok) {
+			return null;
+		}
+
+		const data = await response.json().catch(() => []);
+		const candidate = Array.isArray(data) ? data[0] : null;
+		return typeof candidate?.language === 'string' ? candidate.language : null;
+	} catch (error) {
+		console.warn('LibreTranslate detect error:', error);
+		return null;
+	}
+}
+
+async function translateSnippetWithLibre({ text, targetLanguage }) {
+	if (!text) {
+		return '';
+	}
+
+	const target = resolveTargetLanguageCode(targetLanguage);
+	const detected = await detectLanguageWithLibre(text);
+
+	if (detected && detected === target) {
+		return text;
+	}
+
+	return translateWithLibre({ text, targetLanguage });
+}
+
 
 function getUserIdFromAuthHeader(headerValue) {
 	if (!headerValue) {
@@ -127,7 +171,7 @@ function buildPrompt({ systemPrompt, targetLanguage, userPrompt, contextHistory 
 		? `Recent context:\n${contextHistory.join('\n')}`
 		: 'Recent context: (none)';
 
-	return `${systemPrompt}\n\nYou are assisting in real-time. Use the target language: ${targetLanguage}.\n\n${historyBlock}\n\nUser request: ${userPrompt || 'Analyze the scene and offer guidance.'}\n\nRespond ONLY as strict JSON with keys: analysis, translation, wingmanSuggestions. Keep analysis under 120 characters. Provide up to 3 short wingmanSuggestions, each under 120 characters. If unsure, use empty strings.`;
+	return `${systemPrompt}\n\nYou are assisting in real-time. Use the target language for wingmanSuggestions: ${targetLanguage}.\n\n${historyBlock}\n\nUser request: ${userPrompt || 'Analyze the scene and offer guidance.'}\n\nRespond ONLY as strict JSON with keys: analysis, translation, wingmanSuggestions. Keep analysis under 120 characters. Set translation to an empty string. Provide up to 3 short wingmanSuggestions, each under 120 characters, written in the target language. If unsure, use empty strings.`;
 }
 
 function safeParseJson(text) {
@@ -184,6 +228,74 @@ function extractTextFromResult(result) {
 	return '';
 }
 
+router.post('/translate', async (req, res) => {
+	try {
+		const userId = getUserIdFromAuthHeader(req.headers.authorization);
+
+		if (!userId) {
+			return res.status(401).json({ message: 'Unauthorized.' });
+		}
+
+		const { translationSnippet } = req.body || {};
+		if (!translationSnippet) {
+			return res.json({ translation: '' });
+		}
+
+		const userConfig = await loadUserConfig(userId);
+		const translatedText = await translateSnippetWithLibre({
+			text: translationSnippet,
+			targetLanguage: userConfig.targetLanguage,
+		});
+
+		return res.json({ translation: translatedText || '' });
+	} catch (error) {
+		console.error('Translate error:', error);
+		return res.status(500).json({ message: 'Failed to translate.' });
+	}
+});
+
+router.get('/health', async (req, res) => {
+	try {
+		return res.json({
+			ok: true,
+			geminiConfigured: Boolean(GEMINI_API_KEY),
+			libreTranslateUrl: LIBRE_TRANSLATE_URL || null,
+		});
+	} catch (error) {
+		return res.status(500).json({ ok: false });
+	}
+});
+
+router.get('/logs', async (req, res) => {
+	try {
+		const userId = getUserIdFromAuthHeader(req.headers.authorization);
+
+		if (!userId) {
+			return res.status(401).json({ message: 'Unauthorized.' });
+		}
+
+		const limitRaw = Number(req.query.limit);
+		const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+
+		const [rows] = await pool.execute(
+			`SELECT id, emotion_analyzed, translation_snippet, created_at FROM interaction_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ${limit}`,
+			[userId]
+		);
+
+		return res.json({
+			logs: rows.map((row) => ({
+				id: row.id,
+				analysis: row.emotion_analyzed,
+				translationSnippet: row.translation_snippet,
+				createdAt: row.created_at,
+			})),
+		});
+	} catch (error) {
+		console.error('Logs error:', error);
+		return res.status(500).json({ message: 'Failed to load logs.' });
+	}
+});
+
 async function logInteraction({ userId, analysis, translationSnippet }) {
 	if (!userId) {
 		return;
@@ -228,18 +340,26 @@ router.post('/analyze-environment', async (req, res) => {
 			return res.status(400).json({ message: 'imageBase64 is required.' });
 		}
 
+		const sanitizedImageBase64 = String(imageBase64)
+			.replace(/^data:[^;]+;base64,/, '')
+			.trim();
+
 		const userConfig = await loadUserConfig(userId);
 		const translatedText = translationSnippet
-			? await translateWithLibre({
+			? await translateSnippetWithLibre({
 				text: translationSnippet,
 				targetLanguage: userConfig.targetLanguage,
 			})
 			: '';
+		const nextContextHistory = Array.isArray(contextHistory) ? [...contextHistory] : [];
+		if (translationSnippet) {
+			nextContextHistory.unshift(`Heard: ${translationSnippet}`);
+		}
 		const promptText = buildPrompt({
 			systemPrompt: userConfig.systemPrompt,
 			targetLanguage: userConfig.targetLanguage,
 			userPrompt: prompt,
-			contextHistory,
+			contextHistory: nextContextHistory,
 		});
 
 		let parsed = null;
@@ -256,7 +376,7 @@ router.post('/analyze-environment', async (req, res) => {
 							{
 								inlineData: {
 									mimeType: imageMimeType || 'image/jpeg',
-									data: imageBase64,
+									data: sanitizedImageBase64,
 								},
 							},
 						],
