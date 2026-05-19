@@ -19,6 +19,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const DEFAULT_CONFIG = {
     systemPrompt: 'You are a helpful AR social assistant.',
     targetLanguage: 'English',
+    sourceLanguage: 'English',
 };
 
 function getUserIdFromAuthHeader(headerValue) {
@@ -66,7 +67,7 @@ router.get('/config', async (req, res) => {
         }
 
         const [rows] = await pool.execute(
-            'SELECT system_prompt, target_language FROM user_configs WHERE user_id = ?',
+            'SELECT system_prompt, target_language, source_language FROM user_configs WHERE user_id = ?',
             [userId]
         );
 
@@ -77,6 +78,7 @@ router.get('/config', async (req, res) => {
         return res.json({
             systemPrompt: rows[0].system_prompt || DEFAULT_CONFIG.systemPrompt,
             targetLanguage: rows[0].target_language || DEFAULT_CONFIG.targetLanguage,
+            sourceLanguage: rows[0].source_language || DEFAULT_CONFIG.sourceLanguage,
         });
     } catch (error) {
         console.error('Get config error:', error);
@@ -94,6 +96,7 @@ router.put('/config', async (req, res) => {
 
         const nextPrompt = sanitizePrompt(req.body?.systemPrompt);
         const nextLanguage = sanitizeLanguage(req.body?.targetLanguage);
+        const nextSourceLanguage = sanitizeLanguage(req.body?.sourceLanguage);
 
         const [rows] = await pool.execute(
             'SELECT id FROM user_configs WHERE user_id = ?',
@@ -102,13 +105,13 @@ router.put('/config', async (req, res) => {
 
         if (rows.length === 0) {
             await pool.execute(
-                'INSERT INTO user_configs (user_id, system_prompt, target_language) VALUES (?, ?, ?)',
-                [userId, nextPrompt, nextLanguage]
+                'INSERT INTO user_configs (user_id, system_prompt, target_language, source_language) VALUES (?, ?, ?, ?)',
+                [userId, nextPrompt, nextLanguage, nextSourceLanguage]
             );
         } else {
             await pool.execute(
-                'UPDATE user_configs SET system_prompt = ?, target_language = ? WHERE user_id = ?',
-                [nextPrompt, nextLanguage, userId]
+                'UPDATE user_configs SET system_prompt = ?, target_language = ?, source_language = ? WHERE user_id = ?',
+                [nextPrompt, nextLanguage, nextSourceLanguage, userId]
             );
         }
 
@@ -116,6 +119,7 @@ router.put('/config', async (req, res) => {
             message: 'Configuration updated.',
             systemPrompt: nextPrompt,
             targetLanguage: nextLanguage,
+            sourceLanguage: nextSourceLanguage,
         });
     } catch (error) {
         console.error('Update config error:', error);

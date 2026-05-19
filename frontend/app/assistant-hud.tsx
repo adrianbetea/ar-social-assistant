@@ -2,9 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, SafeAreaView, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { useRouter } from 'expo-router';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import { Audio } from 'expo-av';
+import * as FileSystem from 'expo-file-system';
 
 import { NeonText } from '@/components/neon-text';
 import { getApiBaseUrl, getAuthToken } from '@/constants/api';
+import { criticallyDampedSpringCalculations } from 'react-native-reanimated/lib/typescript/animation/spring';
+
+type TimerHandle = ReturnType<typeof setTimeout>;
 
 const idleSuggestions = [
     'Ask about their latest project.',
@@ -18,6 +23,7 @@ const ANALYSIS_LOCK_MS = 10000;
 const CONTEXT_LIMIT = 5;
 const SIMILARITY_THRESHOLD = 0.7;
 const SUGGESTIONS_SIMILARITY_THRESHOLD = 0.55;
+const WHISPER_RECORD_DURATION_MS = 5000;
 
 function normalizeText(value: string) {
     return value.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
@@ -117,113 +123,246 @@ export default function AssistantHudScreen() {
         }
 
         let isActive = true;
+        let recordingRef: Audio.Recording | null = null;
+        let timer: any = null;
+        let recognition: any = null;
+        let interimDebounce: any = null;
+        let lastTranslatedText = '';
 
-        if (Platform.OS === 'web') {
-            const SpeechRecognition =
-                (window as unknown as { SpeechRecognition?: typeof window.SpeechRecognition }).SpeechRecognition ||
-                (window as unknown as { webkitSpeechRecognition?: typeof window.SpeechRecognition }).webkitSpeechRecognition;
+        async function translateText(text: string) {
+            const token = getAuthToken();
+            if (!token || !text.trim()) return;
+            try {
+                const response = await fetch(`${apiBaseUrl}/api/whisper/translate-text`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({ text: text.trim() }),
+                });
+                if (response.ok && isActive) {
+                    const data = await response.json();
+                    const translated = data.text?.trim();
+                    const original = data.originalText?.trim();
+                    if (translated && original && translated !== original) {
+                        setTranslation(translated);
+                        setSpeechText(original);
+                        lastTranslatedText = original;
+                    } else if (original) {
+                        setSpeechText(original);
+                        setTranslation('');
+                    }
+                }
+            } catch (err: any) {
+                console.error('[HUD] translate error:', err?.message);
+            }
+        }
 
+        // --- Web: Use Web Speech API (Google-powered, real-time, no hallucinations) ---
+        async function startWebSpeechRecognition() {
+            const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
             if (!SpeechRecognition) {
                 setSpeechStatus('ERROR');
-                setSpeechText('Speech recognition unavailable in this browser.');
-                return undefined;
+                setSpeechText('Web Speech API not supported in this browser');
+                return;
             }
 
-            const recognition = new SpeechRecognition();
+            // Fetch user config to get source language (what to listen for)
+            let recognitionLang = 'en-US';
+            try {
+                const token = getAuthToken();
+                if (token) {
+                    const configRes = await fetch(`${apiBaseUrl}/api/user/config`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (configRes.ok) {
+                        const config = await configRes.json();
+                        const langMap: Record<string, string> = {
+                            english: 'en-US',
+                            romanian: 'ro-RO',
+                            french: 'fr-FR',
+                            spanish: 'es-ES',
+                            german: 'de-DE',
+                        };
+                        const source = (config.sourceLanguage || 'english').toLowerCase();
+                        recognitionLang = langMap[source] || 'en-US';
+                    }
+                }
+            } catch (err) {
+                // Fallback to English
+            }
+
+            recognition = new SpeechRecognition();
             recognition.continuous = true;
             recognition.interimResults = true;
-            recognition.lang = 'en-US';
+            recognition.maxAlternatives = 1;
+            recognition.lang = recognitionLang;
 
-            recognition.onresult = (event: SpeechRecognitionEvent) => {
-                const result = event.results[event.results.length - 1];
-                const transcript = result?.[0]?.transcript?.trim();
-                if (transcript && isActive) {
-                    setSpeechText(transcript);
+            recognition.onstart = () => {
+                setSpeechStatus('LIVE');
+            };
+
+            recognition.onresult = (event: any) => {
+                if (!isActive) return;
+
+                let finalTranscript = '';
+                let interimTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const result = event.results[i];
+                    if (result.isFinal) {
+                        finalTranscript += result[0].transcript;
+                    } else {
+                        interimTranscript += result[0].transcript;
+                    }
+                }
+
+                // Show interim results immediately and debounce-translate
+                if (interimTranscript) {
+                    setSpeechText(interimTranscript);
+                    // Debounce: translate interim after 700ms of no new input
+                    if (interimDebounce) clearTimeout(interimDebounce);
+                    interimDebounce = setTimeout(() => {
+                        if (isActive && interimTranscript !== lastTranslatedText) {
+                            translateText(interimTranscript);
+                        }
+                    }, 700);
+                }
+
+                // For final results, translate immediately (cancel debounce)
+                if (finalTranscript.trim()) {
+                    if (interimDebounce) clearTimeout(interimDebounce);
+                    setSpeechText(finalTranscript.trim());
+                    translateText(finalTranscript.trim());
                 }
             };
 
-            recognition.onerror = () => {
-                if (isActive) {
-                    setSpeechStatus('ERROR');
-                    setSpeechText('Speech recognition stopped.');
+            recognition.onerror = (event: any) => {
+                if (!isActive) return;
+                if (event.error === 'no-speech' || event.error === 'aborted') {
+                    return;
                 }
+                console.warn('Speech recognition error:', event.error);
+                setSpeechStatus('ERROR');
             };
 
             recognition.onend = () => {
                 if (isActive) {
                     try {
                         recognition.start();
-                    } catch (error) {
-                        setSpeechStatus('ERROR');
+                    } catch (e) {
+                        // Already started, ignore
                     }
                 }
             };
 
+            recognition.start();
+        }
+
+        // --- Native: Keep Whisper for mobile (no Web Speech API available) ---
+        async function recordAndTranscribeNative() {
+            if (!isActive) return;
+
             try {
-                recognition.start();
+                await Audio.setAudioModeAsync({
+                    allowsRecordingIOS: true,
+                    playsInSilentModeIOS: true,
+                });
+
+                const { recording } = await Audio.Recording.createAsync(
+                    Audio.RecordingOptionsPresets.HIGH_QUALITY
+                );
+                recordingRef = recording;
                 setSpeechStatus('LIVE');
-            } catch (error) {
-                setSpeechStatus('ERROR');
-                setSpeechText('Speech recognition failed to start.');
-            }
 
-            return () => {
-                isActive = false;
-                recognition.stop();
-            };
-        }
+                await new Promise((resolve) => {
+                    timer = setTimeout(resolve, WHISPER_RECORD_DURATION_MS);
+                });
 
-        const { NativeModules } = require('react-native');
-        if (!NativeModules?.Voice) {
-            setSpeechStatus('ERROR');
-            setSpeechText('Speech recognition requires a dev build.');
-            return () => {
-                isActive = false;
-            };
-        }
+                if (!isActive) return;
 
-        const voiceModule = require('react-native-voice');
-        const Voice = voiceModule.default || voiceModule;
+                await recording.stopAndUnloadAsync();
+                recordingRef = null;
 
-        Voice.onSpeechResults = (event) => {
-            const transcript = event.value?.[0]?.trim();
-            if (transcript && isActive) {
-                setSpeechText(transcript);
-            }
-        };
-
-        Voice.onSpeechPartialResults = (event) => {
-            const transcript = event.value?.[0]?.trim();
-            if (transcript && isActive) {
-                setSpeechText(transcript);
-            }
-        };
-
-        Voice.onSpeechError = () => {
-            if (isActive) {
-                setSpeechStatus('ERROR');
-                setSpeechText('Speech recognition error.');
-            }
-        };
-
-        Voice.start('en-US')
-            .then(() => {
-                if (isActive) {
-                    setSpeechStatus('LIVE');
+                const uri = recording.getURI();
+                if (!uri) {
+                    scheduleNextNative();
+                    return;
                 }
-            })
-            .catch(() => {
+
+                const base64Audio = await FileSystem.readAsStringAsync(uri, {
+                    encoding: 'base64' as any,
+                });
+
+                await FileSystem.deleteAsync(uri, { idempotent: true });
+
+                if (!base64Audio || !isActive) {
+                    scheduleNextNative();
+                    return;
+                }
+
+                const token = getAuthToken();
+                if (!token) {
+                    scheduleNextNative();
+                    return;
+                }
+
+                const response = await fetch(`${apiBaseUrl}/api/whisper/transcribe`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({ audioBase64: base64Audio }),
+                });
+
+                if (response.ok && isActive) {
+                    const data = await response.json();
+                    const text = data.text?.trim();
+                    const original = data.originalText?.trim();
+                    if (text) {
+                        setSpeechText(text);
+                        if (original && original !== text) {
+                            setTranslation(text);
+                            setSpeechText(original);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn('Native speech recording error:', error);
                 if (isActive) {
                     setSpeechStatus('ERROR');
-                    setSpeechText('Speech recognition failed to start.');
                 }
-            });
+            }
+
+            scheduleNextNative();
+        }
+
+        function scheduleNextNative() {
+            if (isActive) {
+                timer = setTimeout(recordAndTranscribeNative, 1000);
+            }
+        }
+
+        if (Platform.OS === 'web') {
+            startWebSpeechRecognition();
+        } else {
+            recordAndTranscribeNative();
+        }
 
         return () => {
             isActive = false;
-            Voice.destroy().then(Voice.removeAllListeners);
+            if (timer) clearTimeout(timer);
+            if (interimDebounce) clearTimeout(interimDebounce);
+            if (recognition) {
+                try { recognition.stop(); } catch (e) {}
+            }
+            if (recordingRef) {
+                recordingRef.stopAndUnloadAsync().catch(() => {});
+            }
         };
-    }, [hasPermissions]);
+    }, [hasPermissions, apiBaseUrl]);
 
     const captureAndAnalyze = useCallback(async () => {
         const token = getAuthToken();
@@ -262,7 +401,7 @@ export default function AssistantHudScreen() {
                 },
                 body: JSON.stringify({
                     imageBase64: snapshot.base64,
-                    imageMimeType: snapshot.mimeType || 'image/jpeg',
+                    imageMimeType: (snapshot as any).mimeType || 'image/jpeg',
                     prompt: 'Provide a quick social read and wingman tips. Return translation as an empty string.',
                     translationSnippet: speechText,
                     contextHistory: contextHistoryRef.current,
@@ -305,7 +444,7 @@ export default function AssistantHudScreen() {
                 }
             }
 
-            if (typeof data.translation === 'string') {
+            if (typeof data.translation === 'string' && data.translation.trim()) {
                 setTranslation(data.translation);
             }
 
@@ -446,9 +585,18 @@ export default function AssistantHudScreen() {
 
                     <View style={styles.subtitlePanel}>
                         <NeonText style={styles.subtitleLabel}>Live Translation</NeonText>
-                        <NeonText style={styles.subtitleText}>
-                            {translation || speechText || 'Listening for speech...'}
-                        </NeonText>
+                        {translation ? (
+                            <>
+                                <NeonText style={styles.subtitleText}>{`translation: ${translation}`}</NeonText>
+                                {speechText && speechText !== translation ? (
+                                    <NeonText style={styles.subtitleOriginal}>{`(original: ${speechText})`}</NeonText>
+                                ) : null}
+                            </>
+                        ) : (
+                            <NeonText style={styles.subtitleText}>
+                                {`speech: ${speechText}` || 'Listening for speech...'}
+                            </NeonText>
+                        )}
                     </View>
 
                     <Pressable style={styles.exitButton} onPress={() => router.back()}>
@@ -669,6 +817,11 @@ const styles = StyleSheet.create({
     subtitleText: {
         fontSize: 13,
         color: '#e9fbff',
+    },
+    subtitleOriginal: {
+        fontSize: 11,
+        color: '#7ab8c7',
+        fontStyle: 'italic',
     },
     exitButton: {
         position: 'absolute',

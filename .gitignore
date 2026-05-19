@@ -30,5 +30,13 @@ build/
 .next/
 .expo/
 
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
 # Local development
 .env.development.local

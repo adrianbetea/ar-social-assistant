@@ -4,6 +4,7 @@ const cors = require('cors');
 const authRoutes = require('./routes/auth.js');
 const userConfigRoutes = require('./routes/user-config.js');
 const assistantRoutes = require('./routes/assistant.js');
+const whisperRoutes = require('./routes/whisper.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +14,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/api/auth', authRoutes);
 app.use('/api/user', userConfigRoutes);
 app.use('/api/ai', assistantRoutes);
+app.use('/api/whisper', whisperRoutes);
 
 app.get('/', (req, res) => {
     res.send('AR Social Assistant Backend is running!');

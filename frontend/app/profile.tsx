@@ -18,6 +18,7 @@ const languages = ['English', 'Spanish', 'German', 'French', 'Romanian'];
 const defaultConfig = {
     systemPrompt: 'You are a helpful AR social assistant.',
     targetLanguage: 'English',
+    sourceLanguage: 'English',
 };
 
 export default function ProfileSettingsScreen() {
@@ -25,6 +26,7 @@ export default function ProfileSettingsScreen() {
     const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
     const [systemPrompt, setSystemPrompt] = useState('');
     const [targetLanguage, setTargetLanguage] = useState(languages[0]);
+    const [sourceLanguage, setSourceLanguage] = useState(languages[0]);
     const [status, setStatus] = useState<'idle' | 'loading' | 'saving'>('loading');
 
     const helperText = useMemo(
@@ -51,12 +53,14 @@ export default function ProfileSettingsScreen() {
                 if (isMounted) {
                     setSystemPrompt(data.systemPrompt || defaultConfig.systemPrompt);
                     setTargetLanguage(data.targetLanguage || defaultConfig.targetLanguage);
+                    setSourceLanguage(data.sourceLanguage || defaultConfig.sourceLanguage);
                     setStatus('idle');
                 }
             } catch (error) {
                 if (isMounted) {
                     setSystemPrompt(defaultConfig.systemPrompt);
                     setTargetLanguage(defaultConfig.targetLanguage);
+                    setSourceLanguage(defaultConfig.sourceLanguage);
                     setStatus('idle');
                 }
             }
@@ -89,6 +93,7 @@ export default function ProfileSettingsScreen() {
                 body: JSON.stringify({
                     systemPrompt,
                     targetLanguage,
+                    sourceLanguage,
                 }),
             });
 
@@ -100,6 +105,7 @@ export default function ProfileSettingsScreen() {
 
             setSystemPrompt(data.systemPrompt || systemPrompt);
             setTargetLanguage(data.targetLanguage || targetLanguage);
+            setSourceLanguage(data.sourceLanguage || sourceLanguage);
             Alert.alert('Configuration saved', 'Your AI core settings are ready.');
         } catch (error) {
             Alert.alert('Save failed', 'Unable to update settings right now.');
@@ -138,7 +144,7 @@ export default function ProfileSettingsScreen() {
                 <View style={styles.sectionCard}>
                     <NeonText style={styles.sectionTitle}>Translation Preferences</NeonText>
                     <NeonText style={styles.sectionCopy}>
-                        Choose the language used for live translations and conversation tips.
+                        Target language: what you want to read (translations appear in this language).
                     </NeonText>
                     <View style={styles.languageGrid}>
                         {languages.map((language) => {
@@ -152,6 +158,33 @@ export default function ProfileSettingsScreen() {
                                         pressed && styles.languageChipPressed,
                                     ]}
                                     onPress={() => setTargetLanguage(language)}
+                                    disabled={status === 'saving'}>
+                                    <NeonText style={[styles.languageLabel, isActive && styles.languageLabelActive]}>
+                                        {language}
+                                    </NeonText>
+                                </Pressable>
+                            );
+                        })}
+                    </View>
+                </View>
+
+                <View style={styles.sectionCard}>
+                    <NeonText style={styles.sectionTitle}>Listening Language</NeonText>
+                    <NeonText style={styles.sectionCopy}>
+                        Source language: the language being spoken around you that you want transcribed.
+                    </NeonText>
+                    <View style={styles.languageGrid}>
+                        {languages.map((language) => {
+                            const isActive = language === sourceLanguage;
+                            return (
+                                <Pressable
+                                    key={language}
+                                    style={({ pressed }) => [
+                                        styles.languageChip,
+                                        isActive && styles.languageChipActive,
+                                        pressed && styles.languageChipPressed,
+                                    ]}
+                                    onPress={() => setSourceLanguage(language)}
                                     disabled={status === 'saving'}>
                                     <NeonText style={[styles.languageLabel, isActive && styles.languageLabelActive]}>
                                         {language}

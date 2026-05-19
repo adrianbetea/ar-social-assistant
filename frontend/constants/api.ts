@@ -1,10 +1,24 @@
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
+const TOKEN_KEY = 'ar_assistant_token';
+
 let authToken: string | null = null;
+
+// Restore token from localStorage on module load (web only)
+if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+  authToken = window.localStorage.getItem(TOKEN_KEY) || null;
+}
 
 export function setAuthToken(token?: string | null) {
   authToken = token?.trim() || null;
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+    if (authToken) {
+      window.localStorage.setItem(TOKEN_KEY, authToken);
+    } else {
+      window.localStorage.removeItem(TOKEN_KEY);
+    }
+  }
 }
 
 export function getAuthToken() {

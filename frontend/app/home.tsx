@@ -10,6 +10,7 @@ import { getApiBaseUrl, getAuthToken } from '@/constants/api';
 const defaultConfig = {
   systemPrompt: 'You are a helpful AR social assistant.',
   targetLanguage: 'English',
+  sourceLanguage: 'English',
 };
 
 export default function HomeScreen() {
@@ -80,6 +81,7 @@ export default function HomeScreen() {
           setConfig({
             systemPrompt: data.systemPrompt || defaultConfig.systemPrompt,
             targetLanguage: data.targetLanguage || defaultConfig.targetLanguage,
+            sourceLanguage: data.sourceLanguage || defaultConfig.sourceLanguage,
           });
           setConfigStatus('idle');
         }
@@ -200,6 +202,10 @@ export default function HomeScreen() {
             <View style={styles.configBlock}>
               <NeonText style={styles.configValue}>Persona</NeonText>
               <NeonText style={styles.configLabel}>{promptPreview || 'Default core prompt'}</NeonText>
+            </View>
+            <View style={styles.configBlock}>
+              <NeonText style={styles.configValue}>{config.sourceLanguage}</NeonText>
+              <NeonText style={styles.configLabel}>Listening language</NeonText>
             </View>
             <View style={styles.configBlock}>
               <NeonText style={styles.configValue}>{config.targetLanguage}</NeonText>
