@@ -7,9 +7,25 @@ import * as FileSystem from 'expo-file-system';
 
 import { NeonText } from '@/components/neon-text';
 import { getApiBaseUrl, getAuthToken } from '@/constants/api';
-import { criticallyDampedSpringCalculations } from 'react-native-reanimated/lib/typescript/animation/spring';
 
 type TimerHandle = ReturnType<typeof setTimeout>;
+
+type DetectedFace = {
+    faceID?: number;
+    bounds: {
+        origin: { x: number; y: number };
+        size: { width: number; height: number };
+    };
+    expression?: {
+        label: string;
+        score: number;
+        raw?: Record<string, number>;
+    };
+    smilingProbability?: number;
+    leftEyeOpenProbability?: number;
+    rightEyeOpenProbability?: number;
+    keypoints?: Array<{ x: number; y: number; name?: string }>;
+};
 
 const idleSuggestions = [
     'Ask about their latest project.',
@@ -55,12 +71,142 @@ function similarityScore(a: string, b: string) {
     return union === 0 ? 0 : intersection / union;
 }
 
+function getEmotionLabel(face: DetectedFace) {
+    if (face.expression?.label) {
+        return face.expression.label;
+    }
+
+    const hasProbabilities =
+        face.smilingProbability !== undefined ||
+        face.leftEyeOpenProbability !== undefined ||
+        face.rightEyeOpenProbability !== undefined;
+    if (!hasProbabilities) {
+        const keypoints = face.keypoints || [];
+        const leftEye = keypoints.find((point) => point.name === 'leftEye');
+        const rightEye = keypoints.find((point) => point.name === 'rightEye');
+        const mouth = keypoints.find((point) => point.name === 'mouthCenter');
+        if (leftEye && rightEye && mouth) {
+            const eyesY = (leftEye.y + rightEye.y) / 2;
+            const faceHeight = face.bounds.size.height || 1;
+            const mouthOffset = (mouth.y - eyesY) / faceHeight;
+
+            if (mouthOffset < 0.45) return 'Happy';
+            if (mouthOffset > 0.65) return 'Sad';
+            return 'Neutral';
+        }
+        return 'Neutral';
+    }
+
+    const smile = face.smilingProbability ?? 0;
+    const leftEye = face.leftEyeOpenProbability ?? 1;
+    const rightEye = face.rightEyeOpenProbability ?? 1;
+    const eyeOpen = (leftEye + rightEye) / 2;
+
+    if (smile > 0.6) return 'Happy';
+    if (smile < 0.2 && eyeOpen < 0.4) return 'Sad';
+    if (eyeOpen < 0.35) return 'Sleepy';
+    if (smile < 0.15 && eyeOpen > 0.7) return 'Serious';
+    return 'Neutral';
+}
+
+function getExpressionLabel(expressions?: Record<string, number>) {
+    if (!expressions) return { label: 'Neutral', score: 0 };
+
+    const entries = Object.entries(expressions);
+    if (!entries.length) return { label: 'Neutral', score: 0 };
+
+    const [rawLabel, score] = entries.reduce(
+        (best, current) => (current[1] > best[1] ? current : best),
+        entries[0]
+    );
+
+    const labelMap: Record<string, string> = {
+        happy: 'Happy',
+        sad: 'Sad',
+        angry: 'Angry',
+        fearful: 'Fear',
+        disgusted: 'Disgust',
+        surprised: 'Surprised',
+        neutral: 'Neutral',
+    };
+
+    if (score < 0.45) {
+        return { label: 'Neutral', score };
+    }
+
+    return {
+        label: labelMap[rawLabel] || 'Neutral',
+        score,
+    };
+}
+
+function getVibeColor(label: string) {
+    if (label === 'Happy') return '#8bff6f';
+    if (label === 'Sad' || label === 'Fear') return '#ff8b6f';
+    if (label === 'Angry' || label === 'Disgust') return '#ff5f5f';
+    if (label === 'Surprised') return '#ffe36f';
+    return '#6ff6ff';
+}
+
+function sanitizeFaceBounds(x: number, y: number, w: number, h: number, maxWidth: number, maxHeight: number) {
+    const safeX = Number.isFinite(x) ? x : 0;
+    const safeY = Number.isFinite(y) ? y : 0;
+    const safeW = Number.isFinite(w) ? w : 0;
+    const safeH = Number.isFinite(h) ? h : 0;
+
+    const width = Math.max(60, Math.min(safeW, maxWidth));
+    const height = Math.max(60, Math.min(safeH, maxHeight));
+    const left = Math.max(0, Math.min(safeX, maxWidth - width));
+    const top = Math.max(0, Math.min(safeY, maxHeight - height));
+
+    return { left, top, width, height };
+}
+
+function createWebLabelSprite(three: any, text: string) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+        return new three.Sprite();
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(8, 24, 36, 0.8)';
+    ctx.strokeStyle = 'rgba(111, 246, 255, 0.6)';
+    ctx.lineWidth = 3;
+    if (typeof (ctx as any).roundRect === 'function') {
+        (ctx as any).roundRect(12, 12, canvas.width - 24, canvas.height - 24, 20);
+        ctx.fill();
+        ctx.stroke();
+    } else {
+        ctx.fillRect(12, 12, canvas.width - 24, canvas.height - 24);
+        ctx.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
+    }
+
+    ctx.fillStyle = '#e9fbff';
+    ctx.font = '28px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const texture = new three.CanvasTexture(canvas);
+    texture.minFilter = three.LinearFilter;
+    const material = new three.SpriteMaterial({ map: texture, transparent: true });
+    const sprite = new three.Sprite(material);
+    sprite.scale.set(0.22, 0.11, 1);
+    return sprite;
+}
+
 export default function AssistantHudScreen() {
     const router = useRouter();
     const { width, height } = useWindowDimensions();
     const timestamp = useMemo(() => new Date().toLocaleTimeString(), []);
     const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
+    const cameraFacing = Platform.OS === 'web' ? 'front' : 'back';
     const cameraRef = useRef<CameraView | null>(null);
+    const webVideoRef = useRef<HTMLVideoElement | null>(null);
+    const webStreamRef = useRef<MediaStream | null>(null);
     const [cameraPermission, requestCameraPermission] = useCameraPermissions();
     const [micPermission, requestMicPermission] = useMicrophonePermissions();
     const [isCameraReady, setIsCameraReady] = useState(false);
@@ -69,6 +215,23 @@ export default function AssistantHudScreen() {
     const [speechText, setSpeechText] = useState('');
     const [suggestions, setSuggestions] = useState<string[]>(idleSuggestions);
     const [latestTip, setLatestTip] = useState('');
+    const [faces, setFaces] = useState<DetectedFace[]>([]);
+    const [faceModule, setFaceModule] = useState<any | null>(null);
+    const [webFaceDetector, setWebFaceDetector] = useState<any | null>(null);
+    const [faceApi, setFaceApi] = useState<any | null>(null);
+    const [webFaceApiReady, setWebFaceApiReady] = useState(false);
+    const [localEmotion, setLocalEmotion] = useState('Neutral');
+    const [vibeColor, setVibeColor] = useState('#6ff6ff');
+    const latestFaceRef = useRef<DetectedFace | null>(null);
+    const lastStableFaceRef = useRef<DetectedFace | null>(null);
+    const webThreeContainerRef = useRef<HTMLDivElement | null>(null);
+    const webThreeRendererRef = useRef<any | null>(null);
+    const webThreeSceneRef = useRef<any | null>(null);
+    const webThreeCameraRef = useRef<any | null>(null);
+    const webThreeLabelRef = useRef<any | null>(null);
+    const webThreeGroupRef = useRef<any | null>(null);
+    const webThreeIconRef = useRef<any | null>(null);
+    const showWebEmotionOverlay = false;
     const [aiStatus, setAiStatus] = useState<'IDLE' | 'SYNC' | 'LIVE' | 'ERROR'>('IDLE');
     const [netStatus, setNetStatus] = useState<'STEADY' | 'AUTH' | 'ERROR'>('STEADY');
     const [isRequestInFlight, setIsRequestInFlight] = useState(false);
@@ -79,6 +242,43 @@ export default function AssistantHudScreen() {
     const lastTipRef = useRef('');
     const lastAnalysisRef = useRef('');
     const lastSuggestionsRef = useRef<string[]>([]);
+    const detectionLogRef = useRef(0);
+
+    useEffect(() => {
+        if (Platform.OS !== 'web') {
+            return;
+        }
+
+        let isActive = true;
+
+        const loadModels = async () => {
+            try {
+                const module = await import('@vladmandic/face-api/dist/face-api.esm.js');
+                if (!isActive) return;
+
+                setFaceApi(module);
+
+                const MODEL_URL = '/face-api-models/';
+                await module.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                await module.nets.faceExpressionNet.loadFromUri(MODEL_URL);
+
+                if (!isActive) return;
+                setWebFaceApiReady(true);
+                console.log('[HUD] face-api models ready');
+                console.log('✅ Web Face AI Models Loaded!');
+            } catch (e) {
+                if (!isActive) return;
+                setWebFaceApiReady(false);
+                console.error('Failed to load Web AI models:', e);
+            }
+        };
+
+        loadModels();
+
+        return () => {
+            isActive = false;
+        };
+    }, []);
 
     const hasPermissions = Boolean(cameraPermission?.granted && micPermission?.granted);
     const statusPills = useMemo(
@@ -89,20 +289,32 @@ export default function AssistantHudScreen() {
         ],
         [aiStatus, hasPermissions, netStatus, speechStatus]
     );
+    const faceDetectionEnabled = Platform.OS !== 'web' && Boolean(faceModule);
+    const webFaceDetectionEnabled = Platform.OS === 'web';
+    const faceDetectorSettings = useMemo(() => {
+        if (!faceModule) return null;
+        return {
+            mode: faceModule.FaceDetectorMode.fast,
+            detectLandmarks: faceModule.FaceDetectorLandmarks.none,
+            runClassifications: faceModule.FaceDetectorClassifications.all,
+            minDetectionInterval: 150,
+            tracking: true,
+        };
+    }, [faceModule]);
+    const handleFacesDetected = useCallback(
+        ({ faces: detectedFaces }: { faces: DetectedFace[] }) => {
+            setFaces(detectedFaces);
+        },
+        []
+    );
     const hudOverlayStyle = useMemo(() => {
-        const overlayWidth = height;
-        const overlayHeight = width;
-        const left = (width - overlayWidth) / 2;
-        const top = (height - overlayHeight) / 2;
-
         return [
             styles.hudOverlay,
             {
-                width: overlayWidth,
-                height: overlayHeight,
-                left,
-                top,
-                transform: [{ rotate: '90deg' }],
+                width,
+                height,
+                left: 0,
+                top: 0,
             },
         ];
     }, [height, width]);
@@ -117,6 +329,522 @@ export default function AssistantHudScreen() {
         }
     }, [cameraPermission, micPermission, requestCameraPermission, requestMicPermission]);
 
+    useEffect(() => {
+        latestFaceRef.current = faces.length > 0 ? faces[0] : null;
+        const candidate = faces[0];
+        if (candidate && candidate.bounds.size.width > 30 && candidate.bounds.size.height > 30) {
+            lastStableFaceRef.current = candidate;
+        }
+    }, [faces]);
+
+    useEffect(() => {
+        if (Platform.OS !== 'web') {
+            return;
+        }
+
+        if (!showWebEmotionOverlay) {
+            return;
+        }
+
+        let isActive = true;
+        let animationId: number | null = null;
+        let three: any = null;
+
+        const setupThree = async () => {
+            try {
+                three = await import('three');
+                if (!isActive) return;
+
+                const container = document.createElement('div');
+                container.style.position = 'fixed';
+                container.style.left = '0';
+                container.style.top = '0';
+                container.style.width = '100%';
+                container.style.height = '100%';
+                container.style.pointerEvents = 'none';
+                container.style.zIndex = '3';
+                document.body.appendChild(container);
+                webThreeContainerRef.current = container;
+
+                const renderer = new three.WebGLRenderer({ antialias: true, alpha: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                container.appendChild(renderer.domElement);
+                webThreeRendererRef.current = renderer;
+
+                const scene = new three.Scene();
+                const camera = new three.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 30);
+                camera.position.set(0, 0, 0.1);
+                webThreeSceneRef.current = scene;
+                webThreeCameraRef.current = camera;
+
+                let lastLabel = 'Emotion: Neutral';
+                const label = createWebLabelSprite(three, lastLabel);
+                const group = new three.Group();
+                label.visible = false;
+                group.add(label);
+                webThreeLabelRef.current = label;
+                webThreeGroupRef.current = group;
+
+                const iconGeometry = new three.SphereGeometry(0.04, 20, 20);
+                const iconMaterial = new three.MeshBasicMaterial({ color: 0x6ff6ff });
+                const iconMesh = new three.Mesh(iconGeometry, iconMaterial);
+                iconMesh.position.set(0.4, 0.0, 0);
+                webThreeIconRef.current = iconMesh;
+                group.add(iconMesh);
+                scene.add(group);
+
+                const onResize = () => {
+                    if (!renderer || !camera) return;
+                    renderer.setSize(window.innerWidth, window.innerHeight);
+                    camera.aspect = window.innerWidth / window.innerHeight;
+                    camera.updateProjectionMatrix();
+                };
+                window.addEventListener('resize', onResize);
+
+                const renderLoop = () => {
+                    if (!isActive || !renderer || !scene || !camera || !label) return;
+
+                    const MARGIN = 40;
+                    const face = latestFaceRef.current ?? lastStableFaceRef.current;
+                    const activeLabel = webThreeLabelRef.current ?? label;
+                    const viewWidth = renderer.domElement.clientWidth || window.innerWidth;
+                    const viewHeight = renderer.domElement.clientHeight || window.innerHeight;
+
+                    const hasFace = Boolean(face && face.bounds.size.width > 30 && face.bounds.size.height > 30);
+                    const rawCenterX = hasFace
+                        ? face!.bounds.origin.x + face!.bounds.size.width / 2
+                        : viewWidth / 2;
+                    const rawCenterY = hasFace
+                        ? face!.bounds.origin.y - face!.bounds.size.height * 0.35
+                        : viewHeight / 2;
+                    const isValidFace = hasFace
+                        && rawCenterX >= MARGIN
+                        && rawCenterX <= viewWidth - MARGIN
+                        && rawCenterY >= MARGIN
+                        && rawCenterY <= viewHeight - MARGIN;
+                    const centerX = isValidFace ? rawCenterX : viewWidth / 2;
+                    const centerY = isValidFace ? rawCenterY : viewHeight / 2;
+                    const cx = centerX / viewWidth;
+                    const cy = centerY / viewHeight;
+                    const ndcX = cx * 2 - 1;
+                    const ndcY = -(cy * 2 - 1);
+                    const vector = new three.Vector3(ndcX, ndcY, -1).unproject(camera);
+                    const direction = vector.sub(camera.position).normalize();
+                    const distance = 1.0;
+                    group.position.copy(camera.position).add(direction.multiplyScalar(distance));
+
+                    const nextLabel = `Emotion: ${hasFace ? getEmotionLabel(face!) : 'Neutral'}`;
+                    if (nextLabel !== lastLabel) {
+                        group.remove(activeLabel);
+                        if (activeLabel.material?.map) {
+                            activeLabel.material.map.dispose();
+                        }
+                        activeLabel.material?.dispose?.();
+                        const newLabel = createWebLabelSprite(three, nextLabel);
+                        newLabel.visible = true;
+                        group.add(newLabel);
+                        webThreeLabelRef.current = newLabel;
+                        lastLabel = nextLabel;
+                    } else {
+                        activeLabel.visible = true;
+                    }
+
+                    if (webThreeIconRef.current) {
+                        const iconColor = nextLabel.includes('Happy')
+                            ? 0x8bff6f
+                            : nextLabel.includes('Sad')
+                                ? 0xff8b6f
+                                : 0x6ff6ff;
+                        webThreeIconRef.current.material.color.setHex(iconColor);
+                    }
+
+                    renderer.render(scene, camera);
+                    animationId = window.requestAnimationFrame(renderLoop);
+                };
+
+                renderLoop();
+
+                return () => {
+                    window.removeEventListener('resize', onResize);
+                };
+            } catch (error) {
+                console.warn('[HUD] Web three.js overlay failed:', error);
+            }
+        };
+
+        let teardown: (() => void) | undefined;
+        setupThree().then((cleanup) => {
+            teardown = cleanup;
+        });
+
+        return () => {
+            isActive = false;
+            if (animationId) {
+                window.cancelAnimationFrame(animationId);
+            }
+            if (webThreeRendererRef.current) {
+                webThreeRendererRef.current.dispose();
+                webThreeRendererRef.current = null;
+            }
+            if (webThreeLabelRef.current) {
+                if (webThreeSceneRef.current) {
+                    webThreeSceneRef.current.remove(webThreeLabelRef.current);
+                }
+                if (webThreeLabelRef.current.material?.map) {
+                    webThreeLabelRef.current.material.map.dispose();
+                }
+                webThreeLabelRef.current.material?.dispose?.();
+                webThreeLabelRef.current = null;
+            }
+            if (webThreeIconRef.current) {
+                webThreeIconRef.current.geometry?.dispose?.();
+                webThreeIconRef.current.material?.dispose?.();
+                webThreeIconRef.current = null;
+            }
+            if (webThreeGroupRef.current && webThreeSceneRef.current) {
+                webThreeSceneRef.current.remove(webThreeGroupRef.current);
+                webThreeGroupRef.current = null;
+            }
+            if (webThreeContainerRef.current) {
+                webThreeContainerRef.current.remove();
+                webThreeContainerRef.current = null;
+            }
+            webThreeSceneRef.current = null;
+            webThreeCameraRef.current = null;
+            if (teardown) {
+                teardown();
+            }
+        };
+    }, [height, width]);
+
+    useEffect(() => {
+        if (Platform.OS === 'web') {
+            return;
+        }
+
+        try {
+            const module = require('expo-face-detector');
+            setFaceModule(module);
+        } catch (error) {
+            setFaceModule(null);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (Platform.OS !== 'web') {
+            return;
+        }
+
+        let isActive = true;
+        let detector: any = null;
+
+        const loadDetector = async () => {
+            try {
+                const tf = await import('@tensorflow/tfjs-core');
+                await import('@tensorflow/tfjs-backend-webgl');
+                const faceDetection = await import('@tensorflow-models/face-detection');
+
+                await tf.setBackend('webgl');
+                await tf.ready();
+
+                detector = await faceDetection.createDetector(
+                    faceDetection.SupportedModels.MediaPipeFaceDetector,
+                    { runtime: 'tfjs', maxFaces: 3, modelType: 'full' }
+                );
+
+                if (isActive) {
+                    setWebFaceDetector(detector);
+                    console.log('[HUD] tfjs face detector ready');
+                }
+            } catch (error) {
+                if (isActive) {
+                    setWebFaceDetector(null);
+                }
+                console.warn('[HUD] Web face detector failed to load:', error);
+            }
+        };
+
+        loadDetector();
+
+        return () => {
+            isActive = false;
+            if (detector?.dispose) {
+                detector.dispose();
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        if (Platform.OS !== 'web') {
+            return;
+        }
+
+        let isActive = true;
+        const setupVideo = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user',
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        frameRate: { ideal: 30 },
+                    },
+                    audio: false,
+                });
+
+                if (!isActive) {
+                    stream.getTracks().forEach((track) => track.stop());
+                    return;
+                }
+
+                const video = document.createElement('video');
+                video.autoplay = true;
+                video.muted = true;
+                video.playsInline = true;
+                video.style.position = 'fixed';
+                video.style.left = '-9999px';
+                video.style.top = '-9999px';
+                video.style.width = '1px';
+                video.style.height = '1px';
+                video.srcObject = stream;
+                document.body.appendChild(video);
+
+                webStreamRef.current = stream;
+                webVideoRef.current = video;
+
+                await video.play();
+                if (isActive) {
+                    setIsCameraReady(true);
+                }
+            } catch (error) {
+                console.warn('[HUD] Web camera setup failed:', error);
+            }
+        };
+
+        setupVideo();
+
+        return () => {
+            isActive = false;
+            if (webStreamRef.current) {
+                webStreamRef.current.getTracks().forEach((track) => track.stop());
+                webStreamRef.current = null;
+            }
+            if (webVideoRef.current) {
+                webVideoRef.current.remove();
+                webVideoRef.current = null;
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!webFaceDetectionEnabled || !hasPermissions) {
+            return undefined;
+        }
+
+        let isActive = true;
+        let inFlight = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+
+        const runDetection = async () => {
+            if (!isActive || !cameraRef.current || !(webFaceDetector || (webFaceApiReady && faceApi))) {
+                return;
+            }
+
+            if (inFlight) {
+                timer = setTimeout(runDetection, 800);
+                return;
+            }
+
+            inFlight = true;
+            try {
+                const video = webVideoRef.current;
+                if (!video || video.readyState < 2) {
+                    if (Date.now() - detectionLogRef.current > 5000) {
+                        console.log('[HUD] Web detect: waiting for video stream');
+                        detectionLogRef.current = Date.now();
+                    }
+                    setFaces([]);
+                } else {
+                    const vidWidth = video.videoWidth || width;
+                    const vidHeight = video.videoHeight || height;
+                    const viewAspect = width / height;
+                    const videoAspect = vidWidth / vidHeight;
+
+                    let scale = 1;
+                    let offsetX = 0;
+                    let offsetY = 0;
+
+                    if (videoAspect > viewAspect) {
+                        scale = height / vidHeight;
+                        const scaledWidth = vidWidth * scale;
+                        offsetX = (width - scaledWidth) / 2;
+                    } else {
+                        scale = width / vidWidth;
+                        const scaledHeight = vidHeight * scale;
+                        offsetY = (height - scaledHeight) / 2;
+                    }
+
+                    let mapped: DetectedFace[] = [];
+                    let expressionDetections: Array<any> | null = null;
+
+                    if (webFaceApiReady && faceApi) {
+                        try {
+                            const options = new faceApi.TinyFaceDetectorOptions({
+                                inputSize: 224,
+                                scoreThreshold: 0.5,
+                            });
+                            expressionDetections = await faceApi
+                                .detectAllFaces(video, options)
+                                .withFaceExpressions();
+                        } catch (error) {
+                            console.warn('[HUD] face-api detect error:', error);
+                            expressionDetections = null;
+                        }
+
+                        if (expressionDetections?.length) {
+                            mapped = expressionDetections.map((det: any, index: number) => {
+                                const box = det?.detection?.box || {};
+                                const scaledX = (box.x ?? 0) * scale;
+                                const scaledY = (box.y ?? 0) * scale;
+                                const scaledWidth = (box.width ?? 0) * scale;
+                                const scaledHeight = (box.height ?? 0) * scale;
+                                const mirroredX = cameraFacing === 'front'
+                                    ? width - (scaledX + scaledWidth) + offsetX
+                                    : scaledX + offsetX;
+                                const safe = sanitizeFaceBounds(
+                                    mirroredX,
+                                    scaledY + offsetY,
+                                    scaledWidth,
+                                    scaledHeight,
+                                    width,
+                                    height
+                                );
+                                const { label, score } = getExpressionLabel(det?.expressions);
+                                return {
+                                    faceID: det?.detection?.score ? `${index}-${det.detection.score}` : index,
+                                    bounds: {
+                                        origin: { x: safe.left, y: safe.top },
+                                        size: { width: safe.width, height: safe.height },
+                                    },
+                                    expression: {
+                                        label,
+                                        score,
+                                        raw: det?.expressions,
+                                    },
+                                } as DetectedFace;
+                            });
+                        }
+                    }
+
+                    if (!mapped.length) {
+                        const detections = await webFaceDetector.estimateFaces(video, {
+                            flipHorizontal: cameraFacing === 'front',
+                        });
+
+                        if (Array.isArray(detections)) {
+                            mapped = detections.map((det: any, index: number) => {
+                            const box = det?.box || det?.boundingBox || {};
+                            let xMin = box.xMin ?? box.left ?? box.x ?? 0;
+                            let yMin = box.yMin ?? box.top ?? box.y ?? 0;
+                            let xMax = box.xMax ?? (xMin + (box.width ?? 0));
+                            let yMax = box.yMax ?? (yMin + (box.height ?? 0));
+
+                            if (!(xMax > xMin && yMax > yMin) && Array.isArray(det?.keypoints)) {
+                                const xs = det.keypoints.map((pt: any) => pt?.x).filter((v: any) => Number.isFinite(v));
+                                const ys = det.keypoints.map((pt: any) => pt?.y).filter((v: any) => Number.isFinite(v));
+                                if (xs.length && ys.length) {
+                                    xMin = Math.min(...xs);
+                                    xMax = Math.max(...xs);
+                                    yMin = Math.min(...ys);
+                                    yMax = Math.max(...ys);
+                                }
+                            }
+                            const faceWidth = Math.max(0, xMax - xMin);
+                            const faceHeight = Math.max(0, yMax - yMin);
+                            const scaledX = xMin * scale;
+                            const scaledY = yMin * scale;
+                            const scaledWidth = faceWidth * scale;
+                            const scaledHeight = faceHeight * scale;
+                            const mirroredX = cameraFacing === 'front'
+                                ? width - (scaledX + scaledWidth) + offsetX
+                                : scaledX + offsetX;
+                            const safe = sanitizeFaceBounds(
+                                mirroredX,
+                                scaledY + offsetY,
+                                scaledWidth,
+                                scaledHeight,
+                                width,
+                                height
+                            );
+
+                            const keypoints = Array.isArray(det?.keypoints)
+                                ? det.keypoints
+                                    .filter((point: any) => Number.isFinite(point?.x) && Number.isFinite(point?.y))
+                                    .map((point: any) => ({
+                                        x: point.x * scale + offsetX,
+                                        y: point.y * scale + offsetY,
+                                        name: point.name,
+                                    }))
+                                : undefined;
+
+                            return {
+                                faceID: det?.faceID ?? det?.id ?? index,
+                                bounds: {
+                                    origin: {
+                                        x: safe.left,
+                                        y: safe.top,
+                                    },
+                                    size: {
+                                        width: safe.width,
+                                        height: safe.height,
+                                    },
+                                },
+                                keypoints,
+                            } as DetectedFace;
+                            });
+                        }
+                    }
+
+                    if (mapped.length) {
+                        const primary = mapped.find((face) => face.expression?.label) ?? mapped[0];
+                        if (primary?.expression?.label) {
+                            setLocalEmotion(primary.expression.label);
+                            setVibeColor(getVibeColor(primary.expression.label));
+                        }
+                        setFaces(mapped);
+                    } else {
+                        setFaces([]);
+                    }
+
+                    if (Date.now() - detectionLogRef.current > 5000) {
+                        console.log(
+                            `[HUD] Web detect: faces=${mapped.length} faceApi=${Boolean(faceApi)} `
+                            + `webDetector=${Boolean(webFaceDetector)} faceApiReady=${webFaceApiReady}`
+                        );
+                        detectionLogRef.current = Date.now();
+                    }
+                }
+            } catch (error) {
+                console.warn('[HUD] Web detect loop error:', error);
+                setFaces([]);
+            } finally {
+                inFlight = false;
+                if (isActive) {
+                    timer = setTimeout(runDetection, 800);
+                }
+            }
+        };
+
+        runDetection();
+
+        return () => {
+            isActive = false;
+            if (timer) {
+                clearTimeout(timer);
+            }
+        };
+    // Remove isCameraReady from the dep array of the web detection useEffect
+    }, [cameraFacing, faceApi, hasPermissions, height, webFaceApiReady, webFaceDetectionEnabled, webFaceDetector, width]);
     useEffect(() => {
         if (!hasPermissions) {
             return undefined;
@@ -512,10 +1240,16 @@ export default function AssistantHudScreen() {
                     <CameraView
                         ref={cameraRef}
                         style={styles.camera}
-                        facing="back"
+                        facing={cameraFacing}
                         flash="off"
                         enableTorch={false}
                         onCameraReady={() => setIsCameraReady(true)}
+                        {...(faceDetectionEnabled && faceDetectorSettings
+                            ? {
+                                onFacesDetected: handleFacesDetected,
+                                faceDetectorSettings,
+                            }
+                            : {})}
                     />
                 ) : (
                     <View style={styles.permissionCard}>
@@ -538,6 +1272,36 @@ export default function AssistantHudScreen() {
             </View>
 
             <View style={styles.hudOverlayContainer} pointerEvents="box-none">
+                {(faceDetectionEnabled || webFaceDetectionEnabled || faces.length > 0) ? (
+                    <View style={styles.faceOverlay} pointerEvents="none">
+                        {faces.map((face) => {
+                            const { origin, size } = face.bounds;
+                            const emotion = getEmotionLabel(face);
+                            return (
+                                <View
+                                    key={face.faceID ?? `${origin.x}-${origin.y}`}
+                                    style={[
+                                        styles.faceFrame,
+                                        {
+                                            left: origin.x,
+                                            top: origin.y,
+                                            width: size.width,
+                                            height: size.height,
+                                        },
+                                    ]}
+                                >
+                                    <View style={[styles.faceLabel, { borderColor: vibeColor }]}>
+                                        <NeonText style={[styles.faceLabelText, { color: vibeColor }]}>
+                                            {emotion}
+                                        </NeonText>
+                                    </View>
+                                    <View style={styles.faceRing} />
+                                    <View style={styles.faceRingInner} />
+                                </View>
+                            );
+                        })}
+                    </View>
+                ) : null}
                 <View style={hudOverlayStyle} pointerEvents="box-none">
                     <View style={styles.headerRow}>
                         <View style={styles.headerLeft}>
@@ -546,6 +1310,11 @@ export default function AssistantHudScreen() {
                         </View>
                         <View style={styles.headerRight}>
                             <NeonText style={styles.timestamp}>{timestamp}</NeonText>
+                            <View style={[styles.emotionBadge, { borderColor: vibeColor }]}> 
+                                <NeonText style={[styles.emotionBadgeText, { color: vibeColor }]}>
+                                    {localEmotion}
+                                </NeonText>
+                            </View>
                             <View style={styles.statusRow}>
                                 {statusPills.map((pill) => (
                                     <View key={pill.label} style={styles.statusPill}>
@@ -673,14 +1442,60 @@ const styles = StyleSheet.create({
         borderRadius: 110,
         backgroundColor: 'rgba(15, 123, 156, 0.35)',
     },
+    faceOverlay: {
+        ...StyleSheet.absoluteFillObject,
+        zIndex: 1,
+    },
+    faceFrame: {
+        position: 'absolute',
+        borderRadius: 999,
+        borderWidth: 2,
+        borderColor: 'rgba(111, 246, 255, 0.6)',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    faceRing: {
+        position: 'absolute',
+        width: '92%',
+        height: '92%',
+        borderRadius: 999,
+        borderWidth: 1,
+        borderColor: 'rgba(111, 246, 255, 0.5)',
+    },
+    faceRingInner: {
+        position: 'absolute',
+        width: '72%',
+        height: '72%',
+        borderRadius: 999,
+        borderWidth: 1,
+        borderColor: 'rgba(111, 246, 255, 0.22)',
+    },
+    faceLabel: {
+        position: 'absolute',
+        top: -24,
+        paddingHorizontal: 8,
+        paddingVertical: 2,
+        borderRadius: 999,
+        borderWidth: 1,
+        borderColor: 'rgba(111, 246, 255, 0.4)',
+        backgroundColor: 'rgba(5, 28, 43, 0.78)',
+    },
+    faceLabelText: {
+        fontSize: 10,
+        letterSpacing: 1.1,
+        color: '#d8fbff',
+    },
     hudOverlay: {
         position: 'absolute',
         paddingHorizontal: 18,
         paddingTop: 12,
         paddingBottom: 18,
+        zIndex: 2,
     },
     hudOverlayContainer: {
         ...StyleSheet.absoluteFillObject,
+        zIndex: 2,
+        elevation: 2,
     },
     headerRow: {
         flexDirection: 'row',
@@ -713,6 +1528,17 @@ const styles = StyleSheet.create({
     statusRow: {
         flexDirection: 'row',
         gap: 6,
+    },
+    emotionBadge: {
+        borderRadius: 999,
+        borderWidth: 1,
+        backgroundColor: 'rgba(5, 28, 43, 0.78)',
+        paddingVertical: 4,
+        paddingHorizontal: 10,
+    },
+    emotionBadgeText: {
+        fontSize: 10,
+        letterSpacing: 1,
     },
     statusPill: {
         borderRadius: 999,
