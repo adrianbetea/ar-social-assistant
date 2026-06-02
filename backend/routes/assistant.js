@@ -18,7 +18,26 @@ const pool = mysql.createPool({
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const LIBRE_TRANSLATE_URL = process.env.LIBRE_TRANSLATE_URL || 'http://localhost:5000';
+const GITHUB_MODELS_ALLOW_INSECURE_TLS =
+	(process.env.GITHUB_MODELS_ALLOW_INSECURE_TLS || 'false').toLowerCase() === 'true';
+const LIBRE_TRANSLATE_URL = (process.env.LIBRE_TRANSLATE_URL || '').trim();
+const LIBRE_TRANSLATE_ENABLED =
+	(process.env.LIBRE_TRANSLATE_ENABLED || 'false').toLowerCase() === 'true' &&
+	Boolean(LIBRE_TRANSLATE_URL);
+
+function createGithubModelsClient() {
+	// Keep TLS verification ON by default.
+	// If explicitly enabled (debug/proxy environments), disable cert
+	// verification process-wide as a fallback for GitHub Models connectivity.
+	if (GITHUB_MODELS_ALLOW_INSECURE_TLS) {
+		process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+	}
+
+	return new OpenAI({
+		baseURL: 'https://models.inference.ai.azure.com',
+		apiKey: GITHUB_TOKEN,
+	});
+}
 
 const DEFAULT_CONFIG = {
 	systemPrompt: 'You are a helpful AR social assistant.',
@@ -52,7 +71,7 @@ function resolveTargetLanguageCode(targetLanguage) {
 
 
 async function translateWithLibre({ text, targetLanguage }) {
-	if (!text || !LIBRE_TRANSLATE_URL) {
+	if (!text || !LIBRE_TRANSLATE_ENABLED) {
 		return '';
 	}
 
@@ -85,7 +104,7 @@ async function translateWithLibre({ text, targetLanguage }) {
 }
 
 async function detectLanguageWithLibre(text) {
-	if (!text || !LIBRE_TRANSLATE_URL) {
+	if (!text || !LIBRE_TRANSLATE_ENABLED) {
 		return null;
 	}
 
@@ -167,9 +186,21 @@ async function loadUserConfig(userId) {
 	};
 }
 
-function buildPrompt({ systemPrompt, targetLanguage, userPrompt, contextHistory }) {
+function buildPrompt({ systemPrompt, targetLanguage, userPrompt, contextHistory, dialogueSegments }) {
     const hasHistory = Array.isArray(contextHistory) && contextHistory.length > 0;
-    
+    const hasDialogue = Array.isArray(dialogueSegments) && dialogueSegments.length > 0;
+
+    const dialogueBlock = hasDialogue
+        ? `LIVE DIALOGUE (speaker-labeled — USER is the operative wearing the AR HUD; OTHER is the person they're talking to):\n${dialogueSegments
+              .map((s) => `${(s.speaker || 'UNKNOWN').toUpperCase()}: ${String(s.text || '').trim()}`)
+              .filter((line) => line.length > 8)
+              .join('\n')}`
+        : '';
+
+    const speakerInstruction = hasDialogue
+        ? `IMPORTANT: Suggestions are advice for USER on what to say next. Never suggest USER repeat or rephrase what USER already said. Suggestions should respond to or build on what OTHER said.`
+        : '';
+
     const historyBlock = hasHistory
         ? `CONVERSATION SO FAR (use this to give specific, progressive suggestions — do NOT give generic advice if context exists):\n${contextHistory.map((h, i) => `[${i + 1}] ${h}`).join('\n')}`
         : 'CONVERSATION SO FAR: (none yet — give general icebreaker suggestions)';
@@ -181,6 +212,10 @@ function buildPrompt({ systemPrompt, targetLanguage, userPrompt, contextHistory 
     return `${systemPrompt}
 
 You are a real-time social wingman assistant. Target language for wingmanSuggestions: ${targetLanguage}.
+
+${dialogueBlock}
+
+${speakerInstruction}
 
 ${historyBlock}
 
@@ -279,7 +314,9 @@ router.get('/health', async (req, res) => {
         return res.json({
             ok: true,
             githubModelsConfigured: Boolean(GITHUB_TOKEN),
-            libreTranslateUrl: LIBRE_TRANSLATE_URL || null,
+			githubModelsInsecureTls: GITHUB_MODELS_ALLOW_INSECURE_TLS,
+			libreTranslateEnabled: LIBRE_TRANSLATE_ENABLED,
+			libreTranslateUrl: LIBRE_TRANSLATE_ENABLED ? LIBRE_TRANSLATE_URL : null,
         });
     } catch (error) {
         return res.status(500).json({ ok: false });
@@ -353,7 +390,7 @@ router.post('/analyze-environment', async (req, res) => {
 			return res.status(401).json({ message: 'Unauthorized.' });
 		}
 
-		const { imageBase64, imageMimeType, prompt, contextHistory, translationSnippet } = req.body || {};
+		const { imageBase64, imageMimeType, prompt, contextHistory, translationSnippet, dialogueSegments } = req.body || {};
 
 		if (!imageBase64) {
 			console.warn('AI request blocked: missing imageBase64.');
@@ -380,15 +417,13 @@ router.post('/analyze-environment', async (req, res) => {
 			targetLanguage: userConfig.targetLanguage,
 			userPrompt: prompt,
 			contextHistory: nextContextHistory,
+			dialogueSegments,
 		});
 
 		let parsed = null;
 		let text = '';
 		try {
-			const client = new OpenAI({
-				baseURL: 'https://models.inference.ai.azure.com',
-				apiKey: GITHUB_TOKEN,
-			});
+			const client = createGithubModelsClient();
 
 			const result = await client.chat.completions.create({
 				model: 'gpt-4o-mini',
@@ -415,11 +450,17 @@ router.post('/analyze-environment', async (req, res) => {
 			console.log('GitHub Models response text:', text);
 			parsed = safeParseJson(text);
 		} catch (error) {
-			console.error('GitHub Models analyze error:', error);
+			console.error('GitHub Models analyze error:', {
+				message: error?.message,
+				status: error?.status,
+				code: error?.code,
+				name: error?.name,
+			});
 			return res.json({
 				analysis: '',
 				translation: translatedText || '',
 				wingmanSuggestions: [],
+				error: 'github-models-unavailable',
 			});
 		}
 		if (parsed && typeof parsed === 'object') {
@@ -488,10 +529,7 @@ router.post('/analyze-environment/stream', async (req, res) => {
 		res.setHeader('Cache-Control', 'no-cache');
 		res.setHeader('Connection', 'keep-alive');
 
-		const client = new OpenAI({
-			baseURL: 'https://models.inference.ai.azure.com',
-			apiKey: GITHUB_TOKEN,
-		});
+		const client = createGithubModelsClient();
 
 		const stream = await client.chat.completions.create({
 			model: 'gpt-4o-mini',

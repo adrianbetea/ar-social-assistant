@@ -2,7 +2,12 @@ flask
 flask-cors
 numpy
 torch
+torchaudio
+soundfile
 tqdm
 more-itertools
 tiktoken
 numba
+pyannote.audio>=3.1
+huggingface_hub
+omegaconf

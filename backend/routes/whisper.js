@@ -142,6 +142,90 @@ router.get('/health', async (req, res) => {
 	}
 });
 
+async function getUserVoiceEmbedding(userId) {
+	try {
+		const [rows] = await pool.execute(
+			'SELECT voice_embedding FROM users WHERE id = ?',
+			[userId]
+		);
+		const raw = rows?.[0]?.voice_embedding;
+		if (!raw) return null;
+		const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+		return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+	} catch (error) {
+		console.warn('Failed to load voice embedding:', error.message);
+		return null;
+	}
+}
+
+router.get('/enrollment', async (req, res) => {
+	const userId = getUserIdFromAuthHeader(req.headers.authorization);
+	if (!userId) return res.status(401).json({ message: 'Unauthorized.' });
+	try {
+		const [rows] = await pool.execute(
+			'SELECT voice_embedding IS NOT NULL AS enrolled, voice_enrolled_at FROM users WHERE id = ?',
+			[userId]
+		);
+		const row = rows?.[0] || {};
+		return res.json({
+			enrolled: Boolean(row.enrolled),
+			enrolledAt: row.voice_enrolled_at || null,
+		});
+	} catch (error) {
+		return res.status(500).json({ message: 'Failed to read enrollment status.' });
+	}
+});
+
+router.post('/enroll', async (req, res) => {
+	const userId = getUserIdFromAuthHeader(req.headers.authorization);
+	if (!userId) return res.status(401).json({ message: 'Unauthorized.' });
+
+	const { audioBase64 } = req.body || {};
+	if (!audioBase64) {
+		return res.status(400).json({ message: 'audioBase64 is required.' });
+	}
+
+	try {
+		const response = await fetch(`${WHISPER_URL}/enroll`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ audioBase64 }),
+		});
+		const data = await response.json().catch(() => ({}));
+		if (!response.ok) {
+			return res.status(response.status).json({
+				message: data.error || 'Voice enrollment failed.',
+			});
+		}
+		const embedding = data.embedding;
+		if (!Array.isArray(embedding) || embedding.length === 0) {
+			return res.status(500).json({ message: 'Empty embedding returned.' });
+		}
+		await pool.execute(
+			'UPDATE users SET voice_embedding = ?, voice_enrolled_at = NOW() WHERE id = ?',
+			[JSON.stringify(embedding), userId]
+		);
+		return res.json({ enrolled: true, dim: embedding.length });
+	} catch (error) {
+		console.error('Enroll proxy error:', error);
+		return res.status(500).json({ message: 'Voice enrollment failed.' });
+	}
+});
+
+router.delete('/enrollment', async (req, res) => {
+	const userId = getUserIdFromAuthHeader(req.headers.authorization);
+	if (!userId) return res.status(401).json({ message: 'Unauthorized.' });
+	try {
+		await pool.execute(
+			'UPDATE users SET voice_embedding = NULL, voice_enrolled_at = NULL WHERE id = ?',
+			[userId]
+		);
+		return res.json({ enrolled: false });
+	} catch (error) {
+		return res.status(500).json({ message: 'Failed to clear enrollment.' });
+	}
+});
+
 router.post('/transcribe', async (req, res) => {
 	try {
 		const userId = getUserIdFromAuthHeader(req.headers.authorization);
@@ -150,7 +234,7 @@ router.post('/transcribe', async (req, res) => {
 			return res.status(401).json({ message: 'Unauthorized.' });
 		}
 
-		const { audioBase64 } = req.body || {};
+		const { audioBase64, sourceLanguage, skipTranslation } = req.body || {};
 
 		if (!audioBase64) {
 			return res.status(400).json({ message: 'audioBase64 is required.' });
@@ -160,14 +244,25 @@ router.post('/transcribe', async (req, res) => {
 		const targetLanguage = await getUserTargetLanguage(userId);
 		const targetCode = resolveLanguageCode(targetLanguage);
 
-		// First, transcribe with Whisper to get original text + detected language
-		const whisperResponse = await fetch(`${WHISPER_URL}/transcribe`, {
+		// Pin the source language for Whisper to avoid per-chunk auto-detection
+		// (which is the #1 cause of garbled multilingual hallucinations).
+		const sourceCode = sourceLanguage ? resolveLanguageCode(sourceLanguage) : undefined;
+
+		// If the user enrolled their voice, route through the diarize endpoint
+		// so we get a USER/OTHER speaker label per chunk.
+		const userEmbedding = await getUserVoiceEmbedding(userId);
+		const whisperEndpoint = userEmbedding ? '/diarize-transcribe' : '/transcribe';
+		const whisperBody = {
+			audioBase64,
+			task: 'transcribe',
+			...(sourceCode ? { language: sourceCode } : {}),
+			...(userEmbedding ? { userEmbedding } : {}),
+		};
+
+		const whisperResponse = await fetch(`${WHISPER_URL}${whisperEndpoint}`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				audioBase64,
-				task: 'transcribe',
-			}),
+			body: JSON.stringify(whisperBody),
 		});
 
 		if (!whisperResponse.ok) {
@@ -180,9 +275,32 @@ router.post('/transcribe', async (req, res) => {
 		const whisperData = await whisperResponse.json();
 		const originalText = (whisperData.text || '').trim();
 		const detectedLang = whisperData.language || '';
+		const speaker = whisperData.speaker || (userEmbedding ? 'UNKNOWN' : null);
+		const rawSegments = Array.isArray(whisperData.segments) ? whisperData.segments : [];
 
 		if (!originalText) {
-			return res.json({ text: '', originalText: '', language: detectedLang });
+			return res.json({
+				text: '', originalText: '', language: detectedLang,
+				speaker, segments: [],
+			});
+		}
+
+		const buildLabeledSegments = (translated) => rawSegments.map((s) => ({
+			start: s.start, end: s.end,
+			text: s.text,
+			speaker: s.speaker || speaker || 'UNKNOWN',
+		}));
+
+		// Frontend asked us to skip server-side translation (it will translate
+		// locally e.g. via Chrome's on-device Translator API for speed).
+		if (skipTranslation) {
+			return res.json({
+				text: originalText,
+				originalText,
+				language: detectedLang,
+				speaker,
+				segments: buildLabeledSegments(),
+			});
 		}
 
 		// If detected language matches target, no translation needed
@@ -191,6 +309,8 @@ router.post('/transcribe', async (req, res) => {
 				text: originalText,
 				originalText,
 				language: detectedLang,
+				speaker,
+				segments: buildLabeledSegments(),
 			});
 		}
 
@@ -202,6 +322,7 @@ router.post('/transcribe', async (req, res) => {
 				body: JSON.stringify({
 					audioBase64,
 					task: 'translate',
+					...(sourceCode ? { language: sourceCode } : {}),
 				}),
 			});
 
@@ -212,6 +333,8 @@ router.post('/transcribe', async (req, res) => {
 					text: translatedText || originalText,
 					originalText,
 					language: detectedLang,
+					speaker,
+					segments: buildLabeledSegments(),
 				});
 			}
 		}
@@ -223,6 +346,8 @@ router.post('/transcribe', async (req, res) => {
 			text: translatedText,
 			originalText,
 			language: detectedLang,
+			speaker,
+			segments: buildLabeledSegments(),
 		});
 	} catch (error) {
 		console.error('Whisper proxy error:', error);

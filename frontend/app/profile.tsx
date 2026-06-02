@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     Alert,
+    Platform,
     Pressable,
     SafeAreaView,
     ScrollView,
@@ -9,10 +10,14 @@ import {
     View,
 } from 'react-native';
 import { useRouter } from 'expo-router';
+import { Audio } from 'expo-av';
+import * as FileSystem from 'expo-file-system';
 
 import { CyberButton } from '@/components/cyber-button';
 import { NeonText } from '@/components/neon-text';
 import { getApiBaseUrl, getAuthToken } from '@/constants/api';
+
+const ENROLL_DURATION_MS = 12000;
 
 const languages = ['English', 'Spanish', 'German', 'French', 'Romanian'];
 const defaultConfig = {
@@ -28,6 +33,14 @@ export default function ProfileSettingsScreen() {
     const [targetLanguage, setTargetLanguage] = useState(languages[0]);
     const [sourceLanguage, setSourceLanguage] = useState(languages[0]);
     const [status, setStatus] = useState<'idle' | 'loading' | 'saving'>('loading');
+
+    const [voiceEnrolled, setVoiceEnrolled] = useState<boolean | null>(null);
+    const [voiceEnrolledAt, setVoiceEnrolledAt] = useState<string | null>(null);
+    const [voiceStatus, setVoiceStatus] = useState<'idle' | 'recording' | 'uploading' | 'clearing'>('idle');
+    const [voiceCountdown, setVoiceCountdown] = useState<number>(0);
+    const mediaRecorderRef = useRef<any>(null);
+    const mediaStreamRef = useRef<any>(null);
+    const nativeRecordingRef = useRef<Audio.Recording | null>(null);
 
     const helperText = useMemo(
         () => 'Define your assistant tone, behavior, and constraints for live support.',
@@ -72,6 +85,186 @@ export default function ProfileSettingsScreen() {
             isMounted = false;
         };
     }, [apiBaseUrl]);
+
+    // Load voice enrollment status
+    useEffect(() => {
+        let isMounted = true;
+        const loadEnrollment = async () => {
+            const token = getAuthToken();
+            if (!token) {
+                if (isMounted) setVoiceEnrolled(false);
+                return;
+            }
+            try {
+                const res = await fetch(`${apiBaseUrl}/api/whisper/enrollment`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                const data = await res.json().catch(() => ({}));
+                if (isMounted && res.ok) {
+                    setVoiceEnrolled(Boolean(data.enrolled));
+                    setVoiceEnrolledAt(data.enrolledAt || null);
+                }
+            } catch {
+                if (isMounted) setVoiceEnrolled(false);
+            }
+        };
+        loadEnrollment();
+        return () => { isMounted = false; };
+    }, [apiBaseUrl]);
+
+    async function blobToBase64(blob: Blob): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const result = reader.result as string;
+                const comma = result.indexOf(',');
+                resolve(comma >= 0 ? result.slice(comma + 1) : result);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    async function uploadEnrollment(audioBase64: string) {
+        const token = getAuthToken();
+        if (!token) {
+            Alert.alert('Sign in required', 'Please log in before enrolling your voice.');
+            return;
+        }
+        setVoiceStatus('uploading');
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/whisper/enroll`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({ audioBase64 }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.message || 'Voice enrollment failed.');
+            }
+            setVoiceEnrolled(true);
+            setVoiceEnrolledAt(new Date().toISOString());
+            Alert.alert('Voice enrolled', 'Your voiceprint is saved. The AI will now know when you speak.');
+        } catch (err: any) {
+            Alert.alert('Enrollment failed', err?.message || 'Could not save voiceprint.');
+        } finally {
+            setVoiceStatus('idle');
+            setVoiceCountdown(0);
+        }
+    }
+
+    async function startEnrollmentWeb() {
+        try {
+            const stream = await (navigator.mediaDevices as any).getUserMedia({ audio: true });
+            mediaStreamRef.current = stream;
+            const recorder = new (window as any).MediaRecorder(stream, { mimeType: 'audio/webm' });
+            mediaRecorderRef.current = recorder;
+            const chunks: BlobPart[] = [];
+            recorder.ondataavailable = (e: any) => {
+                if (e.data && e.data.size > 0) chunks.push(e.data);
+            };
+            recorder.onstop = async () => {
+                try {
+                    stream.getTracks().forEach((t: any) => t.stop());
+                } catch {}
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                if (blob.size < 2000) {
+                    setVoiceStatus('idle');
+                    setVoiceCountdown(0);
+                    Alert.alert('Recording too short', 'Please record at least 5 seconds of speech.');
+                    return;
+                }
+                const b64 = await blobToBase64(blob);
+                await uploadEnrollment(b64);
+            };
+            recorder.start();
+            setVoiceStatus('recording');
+
+            const startedAt = Date.now();
+            setVoiceCountdown(Math.ceil(ENROLL_DURATION_MS / 1000));
+            const tick = setInterval(() => {
+                const remaining = Math.max(0, Math.ceil((ENROLL_DURATION_MS - (Date.now() - startedAt)) / 1000));
+                setVoiceCountdown(remaining);
+                if (remaining <= 0) clearInterval(tick);
+            }, 250);
+
+            setTimeout(() => {
+                try {
+                    if (recorder.state !== 'inactive') recorder.stop();
+                } catch {}
+            }, ENROLL_DURATION_MS);
+        } catch (err: any) {
+            setVoiceStatus('idle');
+            Alert.alert('Microphone error', err?.message || 'Could not access microphone.');
+        }
+    }
+
+    async function startEnrollmentNative() {
+        try {
+            await Audio.requestPermissionsAsync();
+            await Audio.setAudioModeAsync({
+                allowsRecordingIOS: true,
+                playsInSilentModeIOS: true,
+            });
+            const { recording } = await Audio.Recording.createAsync(
+                Audio.RecordingOptionsPresets.HIGH_QUALITY
+            );
+            nativeRecordingRef.current = recording;
+            setVoiceStatus('recording');
+
+            const startedAt = Date.now();
+            setVoiceCountdown(Math.ceil(ENROLL_DURATION_MS / 1000));
+            const tick = setInterval(() => {
+                const remaining = Math.max(0, Math.ceil((ENROLL_DURATION_MS - (Date.now() - startedAt)) / 1000));
+                setVoiceCountdown(remaining);
+                if (remaining <= 0) clearInterval(tick);
+            }, 250);
+
+            await new Promise((r) => setTimeout(r, ENROLL_DURATION_MS));
+            await recording.stopAndUnloadAsync();
+            const uri = recording.getURI();
+            nativeRecordingRef.current = null;
+            if (!uri) {
+                setVoiceStatus('idle');
+                Alert.alert('Recording failed', 'No audio captured.');
+                return;
+            }
+            const b64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' as any });
+            await FileSystem.deleteAsync(uri, { idempotent: true });
+            await uploadEnrollment(b64);
+        } catch (err: any) {
+            setVoiceStatus('idle');
+            Alert.alert('Microphone error', err?.message || 'Could not record audio.');
+        }
+    }
+
+    const handleEnrollVoice = () => {
+        if (voiceStatus !== 'idle') return;
+        if (Platform.OS === 'web') startEnrollmentWeb();
+        else startEnrollmentNative();
+    };
+
+    const handleClearVoice = async () => {
+        const token = getAuthToken();
+        if (!token) return;
+        setVoiceStatus('clearing');
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/whisper/enrollment`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) throw new Error('Failed to clear voiceprint.');
+            setVoiceEnrolled(false);
+            setVoiceEnrolledAt(null);
+        } catch (err: any) {
+            Alert.alert('Clear failed', err?.message || 'Could not clear voiceprint.');
+        } finally {
+            setVoiceStatus('idle');
+        }
+    };
 
     const handleSave = async () => {
         const token = getAuthToken();
@@ -192,6 +385,40 @@ export default function ProfileSettingsScreen() {
                                 </Pressable>
                             );
                         })}
+                    </View>
+                </View>
+
+                <View style={styles.sectionCard}>
+                    <NeonText style={styles.sectionTitle}>Voice Enrollment</NeonText>
+                    <NeonText style={styles.sectionCopy}>
+                        Record ~12 seconds of your voice so the AI can tell when YOU are speaking vs the other person.
+                        Read any text aloud naturally.
+                    </NeonText>
+                    {voiceEnrolled === null ? (
+                        <NeonText style={styles.statusText}>Checking voiceprint status...</NeonText>
+                    ) : voiceEnrolled ? (
+                        <NeonText style={[styles.statusText, { color: '#8bff6f' }]}>
+                            Voiceprint active{voiceEnrolledAt ? ` (saved ${new Date(voiceEnrolledAt).toLocaleString()})` : ''}.
+                        </NeonText>
+                    ) : (
+                        <NeonText style={styles.statusText}>No voiceprint on file. AI cannot distinguish speakers yet.</NeonText>
+                    )}
+                    {voiceStatus === 'recording' ? (
+                        <NeonText style={[styles.statusText, { color: '#ff8b6f' }]}>
+                            Recording... {voiceCountdown}s remaining. Keep speaking.
+                        </NeonText>
+                    ) : null}
+                    {voiceStatus === 'uploading' ? (
+                        <NeonText style={styles.statusText}>Uploading and computing voiceprint...</NeonText>
+                    ) : null}
+                    <View style={{ flexDirection: 'row', gap: 10, flexWrap: 'wrap' }}>
+                        <CyberButton
+                            label={voiceEnrolled ? 'Re-enroll Voice' : 'Enroll Voice'}
+                            onPress={handleEnrollVoice}
+                        />
+                        {voiceEnrolled ? (
+                            <CyberButton label="Clear Voiceprint" onPress={handleClearVoice} />
+                        ) : null}
                     </View>
                 </View>
 

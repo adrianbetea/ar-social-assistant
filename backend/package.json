@@ -4,8 +4,8 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "start": "NODE_TLS_REJECT_UNAUTHORIZED=0 node server.js",
-    "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 nodemon server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "keywords": [],
   "author": "",

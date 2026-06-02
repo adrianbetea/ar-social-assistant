@@ -9,8 +9,14 @@ CREATE TABLE IF NOT EXISTS users (
     id INT AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password VARCHAR(255) NOT NULL,
-    username VARCHAR(100) UNIQUE NOT NULL
+    username VARCHAR(100) UNIQUE NOT NULL,
+    voice_embedding LONGTEXT NULL,
+    voice_enrolled_at TIMESTAMP NULL
 );
+
+-- Migration helper for pre-existing installs (run manually if needed):
+-- ALTER TABLE users ADD COLUMN voice_embedding LONGTEXT NULL,
+--                   ADD COLUMN voice_enrolled_at TIMESTAMP NULL;
 
 -- =========================================
 -- 2. User Configurations Table (AI Profile)

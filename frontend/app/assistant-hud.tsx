@@ -213,6 +213,7 @@ export default function AssistantHudScreen() {
     const [analysis, setAnalysis] = useState('');
     const [translation, setTranslation] = useState('');
     const [speechText, setSpeechText] = useState('');
+    const [dialogueLines, setDialogueLines] = useState<Array<{ speaker: string; text: string; ts: number }>>([]);
     const [suggestions, setSuggestions] = useState<string[]>(idleSuggestions);
     const [faces, setFaces] = useState<DetectedFace[]>([]);
     const [faceModule, setFaceModule] = useState<any | null>(null);
@@ -240,6 +241,7 @@ export default function AssistantHudScreen() {
     const contextHistoryRef = useRef<string[]>([]);
     const lastAnalysisRef = useRef('');
     const lastSuggestionsRef = useRef<string[]>([]);
+    const dialogueSegmentsRef = useRef<Array<{ speaker: string; text: string; ts: number }>>([]);
     const detectionLogRef = useRef(0);
 
     useEffect(() => {
@@ -855,6 +857,148 @@ export default function AssistantHudScreen() {
         let recognition: any = null;
         let interimDebounce: any = null;
         let lastTranslatedText = '';
+        let webMediaStream: MediaStream | null = null;
+        let webMediaRecorder: any = null;
+        let webAudioCtx: AudioContext | null = null;
+        let webAnalyser: AnalyserNode | null = null;
+        let webEnergyTimer: any = null;
+        let webChunkRmsSum = 0;
+        let webChunkRmsCount = 0;
+        let webSourceLangCode: string | undefined;
+        let webTargetLangCode: string | undefined;
+        let webTranslator: any = null;
+        let webTranslatorTried = false;
+
+        // Map app source-language names to ISO-639-1 codes Whisper expects.
+        const SOURCE_LANG_TO_ISO: Record<string, string> = {
+            english: 'en', romanian: 'ro', french: 'fr',
+            spanish: 'es', german: 'de', italian: 'it',
+            portuguese: 'pt', russian: 'ru', japanese: 'ja',
+            chinese: 'zh', korean: 'ko', arabic: 'ar',
+        };
+
+        async function ensureWebTranslator() {
+            if (webTranslator || webTranslatorTried) return webTranslator;
+            webTranslatorTried = true;
+            const T = (window as any).Translator;
+            if (!T || !webSourceLangCode || !webTargetLangCode) return null;
+            if (webSourceLangCode === webTargetLangCode) return null;
+            try {
+                const avail = await T.availability({
+                    sourceLanguage: webSourceLangCode,
+                    targetLanguage: webTargetLangCode,
+                });
+                if (avail === 'unavailable') {
+                    console.warn('[HUD] Chrome Translator unavailable for',
+                        webSourceLangCode, '->', webTargetLangCode);
+                    return null;
+                }
+                webTranslator = await T.create({
+                    sourceLanguage: webSourceLangCode,
+                    targetLanguage: webTargetLangCode,
+                });
+                console.log('[HUD] Chrome Translator ready:',
+                    webSourceLangCode, '->', webTargetLangCode);
+                return webTranslator;
+            } catch (e) {
+                console.warn('[HUD] Chrome Translator init failed:', e);
+                return null;
+            }
+        }
+
+        async function translateLocally(text: string): Promise<string> {
+            const t = await ensureWebTranslator();
+            if (!t) return text;
+            try {
+                return await t.translate(text);
+            } catch {
+                return text;
+            }
+        }
+
+        function pushDialogueLines(incoming: Array<{ speaker: string; text: string }>) {
+            if (!incoming.length) return;
+            const now = Date.now();
+            const stamped = incoming.map((l) => ({
+                speaker: (l.speaker || 'UNKNOWN').toUpperCase(),
+                text: l.text.trim(),
+                ts: now,
+            })).filter((l) => l.text);
+            if (!stamped.length) return;
+            dialogueSegmentsRef.current = [
+                ...dialogueSegmentsRef.current,
+                ...stamped,
+            ].slice(-12);
+            setDialogueLines((prev) => [...prev, ...stamped].slice(-6));
+        }
+
+        async function blobToBase64(blob: Blob): Promise<string> {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const result = reader.result as string;
+                    const comma = result.indexOf(',');
+                    resolve(comma >= 0 ? result.slice(comma + 1) : result);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        async function sendChunkForTranscription(audioBase64: string) {
+            const token = getAuthToken();
+            if (!token || !audioBase64) return;
+            try {
+                // If Chrome Translator is ready, tell the backend to skip translation.
+                const localTranslateReady = !!webTranslator;
+                const response = await fetch(`${apiBaseUrl}/api/whisper/transcribe`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({
+                        audioBase64,
+                        ...(webSourceLangCode ? { sourceLanguage: webSourceLangCode } : {}),
+                        ...(localTranslateReady ? { skipTranslation: true } : {}),
+                    }),
+                });
+                if (!response.ok || !isActive) return;
+                const data = await response.json();
+                let translated = (data.text || '').trim();
+                const original = (data.originalText || '').trim();
+                const speaker = (data.speaker || 'UNKNOWN').toString().toUpperCase();
+                const segs = Array.isArray(data.segments) ? data.segments : [];
+
+                // Backend now drops hallucinated chunks server-side, so empty
+                // text means "nothing real was said" -- don't render anything.
+                if (!translated && !original && segs.length === 0) return;
+
+                // Local on-device translation (Chrome Translator API). Fast (~50ms)
+                // and works while offline once the language pack is downloaded.
+                if (localTranslateReady && original) {
+                    translated = (await translateLocally(original)).trim() || original;
+                }
+
+                if (segs.length > 0) {
+                    pushDialogueLines(
+                        segs
+                            .filter((s: any) => s && typeof s.text === 'string' && s.text.trim())
+                            .map((s: any) => ({
+                                speaker: (s.speaker || speaker || 'UNKNOWN').toString().toUpperCase(),
+                                text: s.text,
+                            }))
+                    );
+                } else if (translated || original) {
+                    pushDialogueLines([{ speaker, text: translated || original }]);
+                }
+
+                if (original) setSpeechText(original);
+                if (translated && translated !== original) setTranslation(translated);
+            } catch (err: any) {
+                console.warn('[HUD] web chunk transcribe failed:', err?.message);
+            }
+        }
 
         async function translateText(text: string) {
             const token = getAuthToken();
@@ -886,7 +1030,121 @@ export default function AssistantHudScreen() {
             }
         }
 
-        // --- Web: Use Web Speech API (Google-powered, real-time, no hallucinations) ---
+        // --- Web: MediaRecorder + Whisper diarize (so we know WHO said what) ---
+        async function startWebMediaRecorderLoop() {
+            try {
+                if (typeof (window as any).MediaRecorder === 'undefined') {
+                    setSpeechStatus('ERROR');
+                    setSpeechText('MediaRecorder unsupported. Cannot capture audio for diarization.');
+                    return;
+                }
+
+                // Look up the user's source/target language and initialise the
+                // on-device Chrome Translator so we don't round-trip to the
+                // backend for translation.
+                try {
+                    const token = getAuthToken();
+                    if (token) {
+                        const cfgRes = await fetch(`${apiBaseUrl}/api/user/config`, {
+                            headers: { Authorization: `Bearer ${token}` },
+                        });
+                        if (cfgRes.ok) {
+                            const cfg = await cfgRes.json();
+                            const src = (cfg.sourceLanguage || '').toString().toLowerCase();
+                            const tgt = (cfg.targetLanguage || '').toString().toLowerCase();
+                            webSourceLangCode = SOURCE_LANG_TO_ISO[src];
+                            webTargetLangCode = SOURCE_LANG_TO_ISO[tgt];
+                        }
+                    }
+                } catch {}
+                // Warm the translator in the background (downloads model first time).
+                ensureWebTranslator();
+
+                webMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                // Set up an analyser to measure mic energy and skip silent chunks.
+                try {
+                    const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+                    if (Ctor) {
+                        webAudioCtx = new Ctor();
+                        const srcNode = webAudioCtx!.createMediaStreamSource(webMediaStream);
+                        webAnalyser = webAudioCtx!.createAnalyser();
+                        webAnalyser.fftSize = 1024;
+                        srcNode.connect(webAnalyser);
+                        const buf = new Uint8Array(webAnalyser.fftSize);
+                        webEnergyTimer = setInterval(() => {
+                            if (!webAnalyser) return;
+                            webAnalyser.getByteTimeDomainData(buf);
+                            let sum = 0;
+                            for (let i = 0; i < buf.length; i++) {
+                                const v = (buf[i] - 128) / 128;
+                                sum += v * v;
+                            }
+                            webChunkRmsSum += Math.sqrt(sum / buf.length);
+                            webChunkRmsCount += 1;
+                        }, 50);
+                    }
+                } catch (e) {
+                    console.warn('[HUD] analyser setup failed:', e);
+                }
+
+                setSpeechStatus('LIVE');
+
+                const CHUNK_MS = 8000;
+                // RMS threshold (0..1). Typical room noise ~0.005, normal speech > 0.03.
+                const SILENCE_RMS = 0.012;
+
+                const recordOne = () => {
+                    if (!isActive || !webMediaStream) return;
+                    const chunks: BlobPart[] = [];
+                    let mimeType = 'audio/webm';
+                    if (!(window as any).MediaRecorder.isTypeSupported(mimeType)) {
+                        mimeType = 'audio/webm;codecs=opus';
+                    }
+                    const recorder = new (window as any).MediaRecorder(webMediaStream, { mimeType });
+                    webMediaRecorder = recorder;
+
+                    // Reset per-chunk energy accumulator.
+                    webChunkRmsSum = 0;
+                    webChunkRmsCount = 0;
+
+                    recorder.ondataavailable = (e: any) => {
+                        if (e.data && e.data.size > 0) chunks.push(e.data);
+                    };
+                    recorder.onstop = async () => {
+                        const avgRms = webChunkRmsCount > 0
+                            ? webChunkRmsSum / webChunkRmsCount
+                            : 0;
+                        const tooQuiet = avgRms < SILENCE_RMS;
+
+                        if (chunks.length > 0 && !tooQuiet) {
+                            const blob = new Blob(chunks, { type: mimeType });
+                            if (blob.size > 1500) {
+                                const b64 = await blobToBase64(blob);
+                                sendChunkForTranscription(b64);
+                            }
+                        } else if (tooQuiet) {
+                            // Silent chunk -- skip upload, avoids Whisper hallucinations.
+                            console.debug(`[HUD] skip silent chunk (rms=${avgRms.toFixed(4)})`);
+                        }
+                        if (isActive) recordOne();
+                    };
+                    recorder.start();
+                    timer = setTimeout(() => {
+                        try {
+                            if (recorder.state !== 'inactive') recorder.stop();
+                        } catch {}
+                    }, CHUNK_MS);
+                };
+
+                recordOne();
+            } catch (err: any) {
+                console.warn('[HUD] web media recorder error:', err?.message);
+                setSpeechStatus('ERROR');
+            }
+        }
+
+        // --- Web fallback: Web Speech API (no diarization) ---
         async function startWebSpeechRecognition() {
             const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
             if (!SpeechRecognition) {
@@ -1055,6 +1313,27 @@ export default function AssistantHudScreen() {
                             setSpeechText(original);
                         }
                     }
+                    // Capture speaker-labeled segments for the AI
+                    const segs = Array.isArray(data.segments) ? data.segments : [];
+                    if (segs.length > 0) {
+                        const now = Date.now();
+                        const incoming = segs
+                            .filter((s: any) => s && typeof s.text === 'string' && s.text.trim())
+                            .map((s: any) => ({
+                                speaker: (s.speaker || data.speaker || 'UNKNOWN').toString().toUpperCase(),
+                                text: s.text.trim(),
+                                ts: now,
+                            }));
+                        dialogueSegmentsRef.current = [
+                            ...dialogueSegmentsRef.current,
+                            ...incoming,
+                        ].slice(-12);
+                    } else if (text && data.speaker) {
+                        dialogueSegmentsRef.current = [
+                            ...dialogueSegmentsRef.current,
+                            { speaker: String(data.speaker).toUpperCase(), text, ts: Date.now() },
+                        ].slice(-12);
+                    }
                 }
             } catch (error) {
                 console.warn('Native speech recording error:', error);
@@ -1073,7 +1352,7 @@ export default function AssistantHudScreen() {
         }
 
         if (Platform.OS === 'web') {
-            startWebSpeechRecognition();
+            startWebMediaRecorderLoop();
         } else {
             recordAndTranscribeNative();
         }
@@ -1082,8 +1361,22 @@ export default function AssistantHudScreen() {
             isActive = false;
             if (timer) clearTimeout(timer);
             if (interimDebounce) clearTimeout(interimDebounce);
+            if (webEnergyTimer) clearInterval(webEnergyTimer);
             if (recognition) {
                 try { recognition.stop(); } catch (e) {}
+            }
+            if (webMediaRecorder) {
+                try { if (webMediaRecorder.state !== 'inactive') webMediaRecorder.stop(); } catch (e) {}
+                webMediaRecorder = null;
+            }
+            if (webMediaStream) {
+                webMediaStream.getTracks().forEach((t) => t.stop());
+                webMediaStream = null;
+            }
+            if (webAudioCtx) {
+                try { webAudioCtx.close(); } catch {}
+                webAudioCtx = null;
+                webAnalyser = null;
             }
             if (recordingRef) {
                 recordingRef.stopAndUnloadAsync().catch(() => {});
@@ -1132,6 +1425,7 @@ export default function AssistantHudScreen() {
                     prompt: 'Provide a quick social read and wingman tips. Return translation as an empty string.',
                     translationSnippet: speechText,
                     contextHistory: contextHistoryRef.current,
+                    dialogueSegments: dialogueSegmentsRef.current.map(({ speaker, text }) => ({ speaker, text })),
                 }),
             });
 
@@ -1171,7 +1465,6 @@ export default function AssistantHudScreen() {
             if (speechText) {
                 const historyEntry = [
                     nextAnalysis ? `Analysis: ${nextAnalysis}` : '',
-                    nextTip ? `Tip: ${nextTip}` : '',
                     speechText ? `Heard: ${speechText}` : '',
                 ]
                     .filter(Boolean)
@@ -1341,19 +1634,27 @@ export default function AssistantHudScreen() {
                     </View>
 
                     <View style={styles.subtitlePanel}>
-                        <NeonText style={styles.subtitleLabel}>Live Translation</NeonText>
-                        {translation ? (
-                            <>
-                                <NeonText style={styles.subtitleText}>{`translation: ${translation}`}</NeonText>
-                                {speechText && speechText !== translation ? (
-                                    <NeonText style={styles.subtitleOriginal}>{`(original: ${speechText})`}</NeonText>
-                                ) : null}
-                            </>
+                        <NeonText style={styles.subtitleLabel}>Live Dialogue</NeonText>
+                        {dialogueLines.length === 0 ? (
+                            <NeonText style={styles.subtitleText}>Listening for speech...</NeonText>
                         ) : (
-                            <NeonText style={styles.subtitleText}>
-                                {`speech: ${speechText}` || 'Listening for speech...'}
-                            </NeonText>
+                            dialogueLines.slice(-3).map((line, idx) => {
+                                const isUser = line.speaker === 'USER';
+                                const tag = isUser ? 'YOU' : line.speaker === 'OTHER' ? 'OTHER' : line.speaker;
+                                const color = isUser ? '#6ff6ff' : line.speaker === 'OTHER' ? '#ff8b6f' : '#9dd3df';
+                                return (
+                                    <NeonText
+                                        key={`${line.ts}-${idx}`}
+                                        style={[styles.subtitleText, { color }]}
+                                    >
+                                        {`${tag}: "${line.text}"`}
+                                    </NeonText>
+                                );
+                            })
                         )}
+                        {translation && dialogueLines.length > 0 && translation !== dialogueLines[dialogueLines.length - 1]?.text ? (
+                            <NeonText style={styles.subtitleOriginal}>{`(translation: ${translation})`}</NeonText>
+                        ) : null}
                     </View>
 
                     <Pressable style={styles.exitButton} onPress={() => router.back()}>
@@ -1576,7 +1877,7 @@ const styles = StyleSheet.create({
     },
     panelLeft: {
         position: 'absolute',
-        bottom: 130,
+        bottom: 198,
         left: 60,
         width: 190,
         borderRadius: 12,
@@ -1588,7 +1889,7 @@ const styles = StyleSheet.create({
     },
     panelRight: {
         position: 'absolute',
-        bottom: 170,
+        bottom: 238,
         right: 18,
         width: 210,
         borderRadius: 12,
@@ -1614,6 +1915,7 @@ const styles = StyleSheet.create({
         left: 140,
         right: 18,
         bottom: 30,
+        maxHeight: 140,
         borderRadius: 12,
         borderWidth: 1,
         borderColor: 'rgba(76, 231, 255, 0.35)',
