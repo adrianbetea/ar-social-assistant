@@ -27,8 +27,8 @@
 *   **Framework:** Express.js (Acts as a secure bridge between the mobile app and the AI APIs)
 
 ### Artificial Intelligence (Emerging Tech)
-*   **LLM & Multimodal AI:** **Google Gemini 2.5 Flash API** 
-    *   *Why Gemini 2.5 Flash?* It is optimized for low-latency, multimodal tasks. It can rapidly process both image frames (for emotion recognition) and text/audio streams (for conversation context) simultaneously, which is critical for real-time AR feedback.
+*   **LLM & Multimodal AI:** **GitHub Models (`gpt-4o-mini`)** 
+    *   *Why this model?* It provides a powerful, low-latency, multimodal API capable of processing both image frames (for scene analysis) and text streams (for conversation context) simultaneously. This is critical for real-time AR feedback. The service is accessed via an Azure-hosted endpoint.
 
 ---
 
@@ -36,17 +36,17 @@
 
 1.  **Capture:** The React Native frontend (`expo-camera` & `expo-av`) captures a frame from the video feed and a snippet of the current audio.
 2.  **Transmit:** This data is sent securely to the Node.js backend.
-3.  **Process:** The backend formats the prompt and sends the multimodal data to the **Gemini 2.5 Flash API**.
-4.  **Display:** Gemini returns the emotion analysis, translated text, and conversation suggestions. The backend sends this back to the frontend, which updates the AR HUD overlays in real-time.
+3.  **Process:** The backend formats the prompt and sends the multimodal data to the **GitHub Models API (`gpt-4o-mini`)**.
+4.  **Display:** The model returns the analysis, and conversation suggestions. The backend sends this back to the frontend, which updates the AR HUD overlays in real-time.
 
 ---
 
 ## Installation & Setup
 
 ### Prerequisites
-*[Node.js](https://nodejs.org/) installed on your machine.
+*   [Node.js](https://nodejs.org/) installed on your machine.
 *   [Expo CLI](https://docs.expo.dev/get-started/installation/) installed globally.
-*   A free API key from[Google AI Studio](https://aistudio.google.com/) for Gemini 2.5 Flash.
+*   A **GitHub Token** with access to the Models Inference API. This should be set as `GITHUB_TOKEN` in the backend's environment.
 
 ### 1. Clone the Repository
 ```bash

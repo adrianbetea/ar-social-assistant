@@ -1,7 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const mysql = require('mysql2/promise');
-const { GoogleGenAI } = require('@google/genai');
+const OpenAI = require('openai');
 
 const router = express.Router();
 
@@ -17,6 +17,7 @@ const pool = mysql.createPool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const LIBRE_TRANSLATE_URL = process.env.LIBRE_TRANSLATE_URL || 'http://localhost:5000';
 
 const DEFAULT_CONFIG = {
@@ -167,11 +168,30 @@ async function loadUserConfig(userId) {
 }
 
 function buildPrompt({ systemPrompt, targetLanguage, userPrompt, contextHistory }) {
-	const historyBlock = Array.isArray(contextHistory) && contextHistory.length > 0
-		? `Recent context:\n${contextHistory.join('\n')}`
-		: 'Recent context: (none)';
+    const hasHistory = Array.isArray(contextHistory) && contextHistory.length > 0;
+    
+    const historyBlock = hasHistory
+        ? `CONVERSATION SO FAR (use this to give specific, progressive suggestions — do NOT give generic advice if context exists):\n${contextHistory.map((h, i) => `[${i + 1}] ${h}`).join('\n')}`
+        : 'CONVERSATION SO FAR: (none yet — give general icebreaker suggestions)';
 
-	return `${systemPrompt}\n\nYou are assisting in real-time. Use the target language for wingmanSuggestions: ${targetLanguage}.\n\n${historyBlock}\n\nUser request: ${userPrompt || 'Analyze the scene and offer guidance.'}\n\nRespond ONLY as strict JSON with keys: analysis, translation, wingmanSuggestions. Keep analysis under 120 characters. Set translation to an empty string. Provide up to 3 short wingmanSuggestions, each under 120 characters, written in the target language. If unsure, use empty strings.`;
+    const contextInstruction = hasHistory
+        ? `IMPORTANT: The conversation has already started. Your suggestions MUST reference or build upon what was already said. Do NOT suggest things that already happened (like "ask about their project" if they already talked about their project). Progress the conversation forward.`
+        : '';
+
+    return `${systemPrompt}
+
+You are a real-time social wingman assistant. Target language for wingmanSuggestions: ${targetLanguage}.
+
+${historyBlock}
+
+${contextInstruction}
+
+Current scene: ${userPrompt || 'Analyze the scene and offer guidance.'}
+
+Respond ONLY as strict JSON with keys: analysis, translation, wingmanSuggestions.
+- analysis: max 120 chars, describe what's happening socially right now
+- translation: empty string
+- wingmanSuggestions: exactly 3 suggestions, each under 120 chars, in ${targetLanguage}, that are SPECIFIC to the conversation history above — not generic tips`;
 }
 
 function safeParseJson(text) {
@@ -255,15 +275,15 @@ router.post('/translate', async (req, res) => {
 });
 
 router.get('/health', async (req, res) => {
-	try {
-		return res.json({
-			ok: true,
-			geminiConfigured: Boolean(GEMINI_API_KEY),
-			libreTranslateUrl: LIBRE_TRANSLATE_URL || null,
-		});
-	} catch (error) {
-		return res.status(500).json({ ok: false });
-	}
+    try {
+        return res.json({
+            ok: true,
+            githubModelsConfigured: Boolean(GITHUB_TOKEN),
+            libreTranslateUrl: LIBRE_TRANSLATE_URL || null,
+        });
+    } catch (error) {
+        return res.status(500).json({ ok: false });
+    }
 });
 
 router.get('/logs', async (req, res) => {
@@ -322,8 +342,8 @@ router.post('/analyze-environment', async (req, res) => {
 			hasImage: Boolean(req.body?.imageBase64),
 			imageMimeType: req.body?.imageMimeType || null,
 		});
-		if (!GEMINI_API_KEY) {
-			return res.status(500).json({ message: 'GEMINI_API_KEY is not configured.' });
+		if (!GITHUB_TOKEN) {
+			return res.status(500).json({ message: 'GITHUB_TOKEN is not configured.' });
 		}
 
 		const userId = getUserIdFromAuthHeader(req.headers.authorization);
@@ -365,35 +385,37 @@ router.post('/analyze-environment', async (req, res) => {
 		let parsed = null;
 		let text = '';
 		try {
-			const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-			const result = await ai.models.generateContent({
-				model: 'gemini-2.5-flash',
-				contents: [
+			const client = new OpenAI({
+				baseURL: 'https://models.inference.ai.azure.com',
+				apiKey: GITHUB_TOKEN,
+			});
+
+			const result = await client.chat.completions.create({
+				model: 'gpt-4o-mini',
+				messages: [
 					{
 						role: 'user',
-						parts: [
-							{ text: promptText },
+						content: [
+							{ type: 'text', text: promptText },
 							{
-								inlineData: {
-									mimeType: imageMimeType || 'image/jpeg',
-									data: sanitizedImageBase64,
+								type: 'image_url',
+								image_url: {
+									url: `data:${imageMimeType || 'image/jpeg'};base64,${sanitizedImageBase64}`,
+									detail: 'low', // use 'low' to save on rate limits
 								},
 							},
 						],
 					},
 				],
+				max_tokens: 512,
+				temperature: 0.7,
 			});
 
-			console.log('Gemini raw result keys:', Object.keys(result || {}));
-			console.log('Gemini raw response keys:', Object.keys(result?.response || {}));
-			text = extractTextFromResult(result);
-			console.log('Gemini response text:', text);
-			if (!text) {
-				console.log('Gemini response raw:', JSON.stringify(result || {}, null, 2));
-			}
+			text = result.choices?.[0]?.message?.content || '';
+			console.log('GitHub Models response text:', text);
 			parsed = safeParseJson(text);
 		} catch (error) {
-			console.error('Gemini analyze error:', error);
+			console.error('GitHub Models analyze error:', error);
 			return res.json({
 				analysis: '',
 				translation: translatedText || '',
@@ -438,8 +460,8 @@ router.post('/analyze-environment', async (req, res) => {
 
 router.post('/analyze-environment/stream', async (req, res) => {
 	try {
-		if (!GEMINI_API_KEY) {
-			return res.status(500).json({ message: 'GEMINI_API_KEY is not configured.' });
+		if (!GITHUB_TOKEN) {
+			return res.status(500).json({ message: 'GITHUB_TOKEN is not configured.' });
 		}
 
 		const userId = getUserIdFromAuthHeader(req.headers.authorization);
@@ -466,29 +488,35 @@ router.post('/analyze-environment/stream', async (req, res) => {
 		res.setHeader('Cache-Control', 'no-cache');
 		res.setHeader('Connection', 'keep-alive');
 
-		const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-		const stream = await ai.models.generateContentStream({
-			model: 'gemini-2.5-flash',
-			contents: [
+		const client = new OpenAI({
+			baseURL: 'https://models.inference.ai.azure.com',
+			apiKey: GITHUB_TOKEN,
+		});
+
+		const stream = await client.chat.completions.create({
+			model: 'gpt-4o-mini',
+			stream: true,
+			messages: [
 				{
 					role: 'user',
-					parts: [
-						{ text: promptText },
+					content: [
+						{ type: 'text', text: promptText },
 						{
-							inlineData: {
-								mimeType: imageMimeType || 'image/jpeg',
-								data: imageBase64,
+							type: 'image_url',
+							image_url: {
+								url: `data:${imageMimeType || 'image/jpeg'};base64,${sanitizedImageBase64}`,
+								detail: 'low',
 							},
 						},
 					],
 				},
 			],
+			max_tokens: 512,
 		});
 
 		for await (const chunk of stream) {
-			const delta = chunk.text();
+			const delta = chunk.choices?.[0]?.delta?.content || '';
 			if (delta) {
-				console.log('Gemini stream delta:', delta);
 				res.write(`data: ${JSON.stringify({ delta })}\n\n`);
 			}
 		}

@@ -36,7 +36,7 @@ const idleSuggestions = [
 const ANALYSIS_INTERVAL_MS = 10000;
 const UI_REFRESH_INTERVAL_MS = 11000;
 const ANALYSIS_LOCK_MS = 10000;
-const CONTEXT_LIMIT = 5;
+const CONTEXT_LIMIT = 10;
 const SIMILARITY_THRESHOLD = 0.7;
 const SUGGESTIONS_SIMILARITY_THRESHOLD = 0.55;
 const WHISPER_RECORD_DURATION_MS = 5000;
@@ -214,7 +214,6 @@ export default function AssistantHudScreen() {
     const [translation, setTranslation] = useState('');
     const [speechText, setSpeechText] = useState('');
     const [suggestions, setSuggestions] = useState<string[]>(idleSuggestions);
-    const [latestTip, setLatestTip] = useState('');
     const [faces, setFaces] = useState<DetectedFace[]>([]);
     const [faceModule, setFaceModule] = useState<any | null>(null);
     const [webFaceDetector, setWebFaceDetector] = useState<any | null>(null);
@@ -239,7 +238,6 @@ export default function AssistantHudScreen() {
     const lastUiRefreshAtRef = useRef(0);
     const lastAnalysisRefreshAtRef = useRef(0);
     const contextHistoryRef = useRef<string[]>([]);
-    const lastTipRef = useRef('');
     const lastAnalysisRef = useRef('');
     const lastSuggestionsRef = useRef<string[]>([]);
     const detectionLogRef = useRef(0);
@@ -646,7 +644,8 @@ export default function AssistantHudScreen() {
         let timer: ReturnType<typeof setTimeout> | null = null;
 
         const runDetection = async () => {
-            if (!isActive || !cameraRef.current || !(webFaceDetector || (webFaceApiReady && faceApi))) {
+            const requiresDetector = webFaceDetector || (webFaceApiReady && faceApi);
+            if (!isActive || (Platform.OS !== 'web' && !cameraRef.current) || !requiresDetector) {
                 return;
             }
 
@@ -1145,13 +1144,6 @@ export default function AssistantHudScreen() {
             const now = Date.now();
             const nextAnalysis = data.analysis || 'Scanning social cues...';
             const nextSuggestions = Array.isArray(data.wingmanSuggestions) ? data.wingmanSuggestions : [];
-            const nextTip = nextSuggestions[0] || '';
-
-            const tipSimilarity = similarityScore(nextTip, lastTipRef.current);
-            if (nextTip && tipSimilarity < SIMILARITY_THRESHOLD) {
-                setLatestTip(nextTip);
-                lastTipRef.current = nextTip;
-            }
 
             const analysisSimilarity = similarityScore(nextAnalysis, lastAnalysisRef.current);
             if (now - lastAnalysisRefreshAtRef.current >= ANALYSIS_LOCK_MS && analysisSimilarity < SIMILARITY_THRESHOLD) {
@@ -1340,11 +1332,7 @@ export default function AssistantHudScreen() {
 
                     <View style={styles.panelRight}>
                         <NeonText style={styles.panelTitle}>Wingman Suggestions</NeonText>
-                        <NeonText style={styles.panelLine}>Latest tip:</NeonText>
-                        <NeonText style={styles.panelLine}>
-                            {latestTip || suggestions[0] || 'Standby for a prompt...'}
-                        </NeonText>
-                        <NeonText style={styles.panelLine}>Stable cues:</NeonText>
+                        <NeonText style={styles.panelLine}>Suggestions:</NeonText>
                         {suggestions.map((suggestion) => (
                             <NeonText key={suggestion} style={styles.panelLine}>
                                 - {suggestion}

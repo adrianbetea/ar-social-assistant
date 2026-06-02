@@ -34,10 +34,11 @@ export default function HomeScreen() {
           : 'Wingman offline';
     const wingmanDetail =
       aiStatus === 'online'
-        ? 'Gemini + Libre ready'
+        ? 'GitHub Models + Libre ready'
         : aiStatus === 'limited'
-          ? 'Libre only (Gemini missing)'
-          : 'Backend unreachable';
+            ? 'Libre only (GitHub token missing)'
+            : 'Backend unreachable';
+
 
     return [
       {
@@ -117,10 +118,10 @@ export default function HomeScreen() {
           return;
         }
 
-        if (data.geminiConfigured) {
-          setAiStatus('online');
+        if (data.githubModelsConfigured) {
+            setAiStatus('online');
         } else {
-          setAiStatus('limited');
+            setAiStatus('limited');
         }
       } catch (error) {
         if (isActive) {
